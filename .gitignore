@@ -1,0 +1,68 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+static-build/
+expo-env.d.ts
+
+# Native
+ios/
+android/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Server build
+server_dist/
+admin/.next/
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+
+# macOS
+.DS_Store
+*.pem
+
+# local env and secrets (never commit)
+.env
+.env*.local
+.env.development
+.env.production
+
+# TypeScript / IDE
+*.tsbuildinfo
+.vercel
+.idea/
+
+# Local / editor
+.local/
+.config/
+
+# Optional: uncomment to ignore Cursor/VSCode workspace
+# .cursor/
+# .vscode/
+
+
+firebase-service-account.json
+server/firebase-service-account.json
+.env
+# Removed *.json to allow package.json and app.json to be tracked
+# *.json
+
+# Stray local secret dumps (never commit)
+file_nka1qg
+file_jyk4d6 (1)

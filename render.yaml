@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: lifewise-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run server:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SERVER_PORT
+        value: 5001
+      - key: HOST
+        value: 0.0.0.0
+      - key: MONGODB_DB_NAME
+        value: lifewise
+      - key: JWT_EXPIRY
+        value: 7d
+      # These need to be set via Render dashboard:
+      # - MONGODB_URI (from MongoDB Atlas)
+      # - JWT_SECRET (generate a secure key)
+      # - OPENAI_API_KEY (optional)
+      # - RESEND_API_KEY (optional)
+      # - AWS_S3_BUCKET (optional)
+      # - AWS_REGION (optional)

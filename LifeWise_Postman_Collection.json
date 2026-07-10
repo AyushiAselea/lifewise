@@ -1,0 +1,767 @@
+{
+  "info": {
+    "name": "LifeWise API Collection",
+    "description": "Complete API collection for LifeWise backend testing",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": "1.0.0"
+  },
+  "item": [
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\": \"John Doe\", \"email\": \"john@example.com\", \"password\": \"password123\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "register"]
+            }
+          }
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\": \"demo@lifewise.test\", \"password\": \"Radhe@1415\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "login"]
+            }
+          }
+        },
+        {
+          "name": "Get Current User",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/me",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "me"]
+            }
+          }
+        },
+        {
+          "name": "Update User Profile",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\": \"Updated Name\", \"phone\": \"+919999000222\", \"dateOfBirth\": \"1990-01-01\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/me",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "me"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transactions",
+      "item": [
+        {
+          "name": "Get All Transactions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/transactions",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "transactions"]
+            }
+          }
+        },
+        {
+          "name": "Create Transaction",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"merchant\": \"Uber\", \"amount\": 250, \"category\": \"travel\", \"isDebit\": true, \"description\": \"Office commute\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/transactions",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "transactions"]
+            }
+          }
+        },
+        {
+          "name": "Sync from SMS",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"transactions\": [{\"merchant\": \"Swiggy\", \"amount\": 380, \"category\": \"food\", \"isDebit\": true, \"smsId\": \"sms_123\", \"message\": \"Food delivery\"}]}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/transactions/sync-from-sms",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "transactions", "sync-from-sms"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Bills & Reminders",
+      "item": [
+        {
+          "name": "Get All Bills",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/bills",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "bills"]
+            }
+          }
+        },
+        {
+          "name": "Create Bill",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\": \"Internet Bill\", \"amount\": 999, \"dueDate\": \"2026-07-15T20:00:00.000Z\", \"category\": \"bills\", \"reminderType\": \"bill\", \"repeatType\": \"monthly\", \"status\": \"active\", \"reminderDaysBefore\": [3, 1, 0]}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bills",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "bills"]
+            }
+          }
+        },
+        {
+          "name": "Quick Add Reminder (Text)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"text\": \"Pay electricity bill 2500 rupees on 20 july\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/reminders/quick-add",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "reminders", "quick-add"]
+            }
+          }
+        },
+        {
+          "name": "Parse Reminder Text",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"text\": \"Doctor appointment on friday at 3pm\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/reminders/parse",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "reminders", "parse"]
+            }
+          }
+        },
+        {
+          "name": "Update Bill",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\": \"Updated Bill Name\", \"isPaid\": true, \"amount\": 3000}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bills/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "bills", ":id"]
+            }
+          }
+        },
+        {
+          "name": "Snooze Bill",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"action\": \"snooze\", \"minutes\": 30}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bills/:id/actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "bills", ":id", "actions"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Family & Health",
+      "item": [
+        {
+          "name": "Get Family Members",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/family",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "family"]
+            }
+          }
+        },
+        {
+          "name": "Create Family Member",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\": \"Papa\", \"relationship\": \"father\", \"dateOfBirth\": \"1958-05-15\", \"bloodGroup\": \"B+\", \"phone\": \"+919999000222\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/family",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "family"]
+            }
+          }
+        },
+        {
+          "name": "Get Health Readings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/family/:id/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "family", ":id", "health"]
+            }
+          }
+        },
+        {
+          "name": "Add Health Reading",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"type\": \"blood_glucose\", \"value\": \"95\", \"unit\": \"mg/dL\", \"notes\": \"Fasting\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/family/:id/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "family", ":id", "health"]
+            }
+          }
+        },
+        {
+          "name": "Add Medicine",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\": \"Aspirin\", \"dosage\": \"500mg\", \"appearance\": \"tablet\", \"color\": \"#FF6B6B\", \"instruction\": \"after food\", \"slots\": {\"morning\": \"8:00 AM\", \"noon\": \"2:00 PM\", \"evening\": \"8:00 PM\"}, \"scheduleType\": \"continuous\", \"startDate\": \"2026-07-01\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/family/:id/medicines",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "family", ":id", "medicines"]
+            }
+          }
+        },
+        {
+          "name": "Mark Medicine as Taken",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"action\": \"taken\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/family/:memberId/medicines/:medId",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "family", ":memberId", "medicines", ":medId"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Notifications",
+      "item": [
+        {
+          "name": "Get Notifications",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/notifications",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "notifications"]
+            }
+          }
+        },
+        {
+          "name": "Mark as Read",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"ids\": [\"notif_id_1\", \"notif_id_2\"]}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/notifications/mark-read",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "notifications", "mark-read"]
+            }
+          }
+        },
+        {
+          "name": "Mark All as Read",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/notifications/mark-read-all",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "notifications", "mark-read-all"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Support Tickets",
+      "item": [
+        {
+          "name": "Get Support Tickets",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/support/tickets?status=active&sort=desc",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "support", "tickets"],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "active"
+                },
+                {
+                  "key": "sort",
+                  "value": "desc"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Support Ticket",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"subject\": \"App crashes on login\", \"description\": \"App is crashing when I try to login\", \"category\": \"bug\", \"priority\": \"high\"}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/support/tickets",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "support", "tickets"]
+            }
+          }
+        },
+        {
+          "name": "Get Ticket Messages",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/support/tickets/:id/messages",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "support", "tickets", ":id", "messages"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Financial Insights",
+      "item": [
+        {
+          "name": "Get Spending Leaks",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/leaks",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "leaks"]
+            }
+          }
+        },
+        {
+          "name": "Get Reports",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/reports?start=2026-07-01&end=2026-07-05",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "reports"],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "2026-07-01"
+                },
+                {
+                  "key": "end",
+                  "value": "2026-07-05"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Life Score",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/life-score",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "life-score"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Settings",
+      "item": [
+        {
+          "name": "Get Settings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/settings",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "settings"]
+            }
+          }
+        },
+        {
+          "name": "Update Settings",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"monthlyBudget\": 50000, \"reminderSettings\": {\"defaultReminderDays\": [7, 3, 1, 0], \"soundEnabled\": false, \"vibrationEnabled\": true}}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/settings",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "settings"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "AI Assistant",
+      "item": [
+        {
+          "name": "Get Assistant Context",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/assistant/context",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "assistant", "context"]
+            }
+          }
+        },
+        {
+          "name": "Chat with Assistant",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"messages\": [{\"role\": \"user\", \"content\": \"What are my biggest spending leaks?\"}]}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/assistant/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "assistant", "chat"]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:5001",
+      "type": "string"
+    },
+    {
+      "key": "token",
+      "value": "",
+      "type": "string"
+    }
+  ]
+}
