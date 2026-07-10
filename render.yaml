@@ -3,7 +3,7 @@ services:
     name: lifewise-backend
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install --include=dev && npm run server:build
     startCommand: npm run server:prod
     envVars:
       - key: NODE_ENV
