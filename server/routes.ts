@@ -1806,15 +1806,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       });
 
-      const result = await (transactions as any).bulkWrite(ops, { ordered: false });
-      
+      let result;
+      try {
+        result = await (transactions as any).bulkWrite(ops, { ordered: false });
+      } catch (err: any) {
+        // Duplicate-key (11000) from the unique (userId, smsId) index just means
+        // "already synced" — the rest of the unordered batch still committed.
+        if (err?.code === 11000 || err?.writeErrors) {
+          result = err.result ?? err;
+        } else {
+          throw err;
+        }
+      }
+
       const synced = (result.upsertedCount || 0) + (result.insertedCount || 0);
       const skipped = txs.length - synced;
 
-      return res.json({ 
-        synced, 
-        skipped, 
-        message: `${synced} synced, ${skipped} duplicates skipped` 
+      return res.json({
+        synced,
+        skipped,
+        message: `${synced} synced, ${skipped} duplicates skipped`
       });
     } catch (err) {
       console.error('Sync from SMS error:', err);
