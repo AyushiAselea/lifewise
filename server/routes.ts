@@ -2991,8 +2991,6 @@ JSON Output:`;
         })),
       };
 
-      puter.authToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0IjoiZ3VpIiwidiI6IjAuMC4wIiwidSI6ImZSUzF2dWZ1U0ZxQzRWOTRzTWxvd2c9PSIsInV1IjoieHI5YkVuRlRRb0dGV1pBRXo3a2hTZz09IiwiaWF0IjoxNzc1MjExMjczfQ.AS5n05GPa63rNr_0KXhVHqCXzm_GCEz2RF4I0SI7MuI';
-
       const sysPrompt = `You are LifeWise AI, an expert, multilingual family, health and financial assistant for the 'LifeWise' app.
 You have access to the user's latest data snapshot in JSON format:
 ${JSON.stringify(snapshot)}
@@ -3011,16 +3009,26 @@ CRITICAL RULES:
         ...userMessages.filter(m => m.role === 'user' || m.role === 'assistant')
       ];
 
-      const response = await puter.ai.chat(chatMessages);
-      
-      let reply = 'Sorry, I could not generate a response right now.';
-      if (response && response.message && Array.isArray(response.message.content)) {
-        reply = response.message.content.map((c: any) => c.text).join('');
-      } else if (response && response.text) {
-        reply = response.text;
-      } else if (typeof response === 'string') {
-        reply = response;
+      const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${openAIKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: OPENAI_MODEL,
+          messages: chatMessages,
+          temperature: 0.4,
+        }),
+      });
+
+      if (!aiRes.ok) {
+        const errBody = await aiRes.text();
+        throw new Error(`openai_chat_failed: ${aiRes.status} ${errBody}`);
       }
+
+      const json = await aiRes.json();
+      const reply = json.choices?.[0]?.message?.content || 'Sorry, I could not generate a response right now.';
 
       return res.json({ reply });
 
