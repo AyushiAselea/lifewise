@@ -2498,8 +2498,8 @@ JSON Output:`;
       const json = await res.json();
       const content = JSON.parse(json.choices[0].message.content);
       return {
-        normalizedText: content.normalizedText || text,
-        detectedLanguage: content.detectedLanguage || languageHint || 'en',
+        normalizedText: text,
+        detectedLanguage: languageHint || 'en',
         data: content.data
       };
     } catch (e) {
