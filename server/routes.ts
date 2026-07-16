@@ -39,6 +39,7 @@ async function initIndexes() {
   const users = db.collection('users');
   const billHistory = db.collection('billHistory');
   const family = db.collection('family_members');
+  const caregiverInvites = db.collection('caregiver_invites');
 
   try {
     // Unique index for SMS deduplication: same user, same SMS unique ID
@@ -49,6 +50,8 @@ async function initIndexes() {
     await (billHistory as any).createIndex({ billId: 1, userId: 1, date: -1 });
     await (users as any).createIndex({ email: 1 }, { unique: true });
     await (family as any).createIndex({ userId: 1 });
+    await (caregiverInvites as any).createIndex({ inviteeEmail: 1, status: 1 });
+    await (caregiverInvites as any).createIndex({ memberId: 1 });
     console.log('[DB] Indexes initialized');
   } catch (err) {
     console.error('[DB] Index initialization failed:', err);
@@ -448,6 +451,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const systemSettings = db.collection('system_settings') as any;
   const billHistory = db.collection('bill_history') as any;
   const healthReadings = db.collection('health_readings') as any;
+  const caregiverInvites = db.collection('caregiver_invites') as any;
   console.log('[DEBUG] registerRoutes: Initializing priority routes');
 
   // --- Priority: File Uploads ---
@@ -481,6 +485,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const list = await family
         .find({ userId: (req as any).userId })
+        .sort({ createdAt: -1 })
+        .toArray();
+      const out = list.map((m: any) => ({
+        id: m._id.toString(),
+        name: m.name,
+        relationship: m.relationship || 'self',
+        avatarUrl: m.avatarUrl || null,
+        dateOfBirth: m.dateOfBirth || null,
+        bloodGroup: m.bloodGroup || null,
+        phone: m.phone || null,
+        modules: Array.isArray(m.modules) ? m.modules : [],
+        features: m.features || {},
+        caregivers: Array.isArray(m.caregivers) ? m.caregivers : [],
+        medicines: Array.isArray(m.medicines) ? m.medicines : [],
+      }));
+      return res.json(out);
+    } catch (err) {
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // --- Family members shared with the current user as a caregiver ---
+  // Must be registered before GET /api/family/:id so "shared-with-me" isn't
+  // swallowed as an :id param.
+  app.get('/api/family/shared-with-me', authMiddleware, async (req, res) => {
+    try {
+      const list = await family
+        .find({ 'connectedCaregivers.userId': (req as any).userId })
         .sort({ createdAt: -1 })
         .toArray();
       const out = list.map((m: any) => ({
@@ -667,6 +699,249 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.status(500).json({ message: 'Server error.' });
     }
   });
+
+  // --- Connected Caregiver (linked-account sharing) ---
+  app.get('/api/family/:memberId/connected-caregivers', authMiddleware, async (req, res) => {
+    try {
+      const member = await family.findOne({ _id: toId(req.params.memberId) });
+      if (!member) return res.status(404).json({ message: 'Not found' });
+
+      const requesterId = (req as any).userId;
+      const connected: any[] = Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : [];
+      const isOwner = member.userId === requesterId;
+      const isCaregiver = connected.some((c: any) => c.userId === requesterId);
+      if (!isOwner && !isCaregiver) return res.status(403).json({ message: 'Forbidden' });
+
+      const allUserIds = [member.userId, ...connected.map((c: any) => c.userId)];
+      const userDocs = await users.find({ _id: { $in: allUserIds.map((id: string) => toId(id)) } }).toArray();
+      const userById = new Map<string, any>(userDocs.map((u: any) => [u._id.toString(), u]));
+
+      const ownerUser = userById.get(String(member.userId));
+      const out = [
+        {
+          id: member.userId,
+          userId: member.userId,
+          name: ownerUser?.name || null,
+          email: ownerUser?.email || null,
+          avatarUrl: ownerUser?.avatarUrl || null,
+          role: 'owner',
+          connectedAt: member.createdAt || null,
+        },
+        ...connected.map((c: any) => {
+          const u = userById.get(String(c.userId));
+          return {
+            id: c.userId,
+            userId: c.userId,
+            name: u?.name || null,
+            email: u?.email || null,
+            avatarUrl: u?.avatarUrl || null,
+            role: 'caregiver',
+            connectedAt: c.connectedAt || null,
+          };
+        }),
+      ];
+      return res.json(out);
+    } catch (err) {
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/family/:memberId/connected-caregivers/invite', authMiddleware, async (req, res) => {
+    try {
+      const requesterId = (req as any).userId;
+      const member = await family.findOne({ _id: toId(req.params.memberId) });
+      if (!member) return res.status(404).json({ message: 'Not found' });
+      if (member.userId !== requesterId) return res.status(403).json({ message: 'Forbidden' });
+
+      const emailRaw = (req.body?.email || '').toString().trim().toLowerCase();
+      if (!emailRaw || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailRaw)) {
+        return res.status(400).json({ message: 'A valid email is required' });
+      }
+
+      const requesterUser = await users.findOne({ _id: toId(requesterId) });
+      if (requesterUser?.email && String(requesterUser.email).toLowerCase() === emailRaw) {
+        return res.status(400).json({ message: 'You cannot invite yourself' });
+      }
+
+      const connected: any[] = Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : [];
+      const alreadyCaregiverUserIds = connected.map((c: any) => c.userId);
+      if (alreadyCaregiverUserIds.length) {
+        const existingUsers = await users.find({ _id: { $in: alreadyCaregiverUserIds.map((id: string) => toId(id)) } }).toArray();
+        if (existingUsers.some((u: any) => String(u.email).toLowerCase() === emailRaw)) {
+          return res.status(409).json({ message: 'This person is already a caregiver' });
+        }
+      }
+
+      const existingInvite = await caregiverInvites.findOne({
+        memberId: member._id,
+        inviteeEmail: emailRaw,
+        status: 'pending',
+      });
+      if (existingInvite) {
+        return res.status(409).json({ message: 'An invite is already pending for this email' });
+      }
+
+      const inviteDoc = {
+        memberId: member._id,
+        memberName: member.name,
+        memberAvatarUrl: member.avatarUrl || null,
+        invitedByUserId: requesterId,
+        invitedByName: requesterUser?.name || '',
+        invitedByEmail: requesterUser?.email || '',
+        inviteeEmail: emailRaw,
+        status: 'pending' as const,
+        createdAt: new Date(),
+        respondedAt: null,
+      };
+      const result = await caregiverInvites.insertOne(inviteDoc);
+
+      try {
+        const invitee = await users.findOne({ email: emailRaw });
+        if (invitee) {
+          const messaging = getFirebaseMessaging();
+          if (messaging) {
+            const tokenDocs = await pushTokens.find({ userId: invitee._id.toString() }).project({ token: 1 }).toArray();
+            const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
+            if (tokens.length) {
+              await messaging.sendEachForMulticast({
+                tokens,
+                notification: {
+                  title: 'Caregiver invite',
+                  body: `${inviteDoc.invitedByName || 'Someone'} wants to add you as a caregiver for ${member.name}.`,
+                },
+                data: { type: 'caregiver_invite', inviteId: result.insertedId.toString() },
+              });
+            }
+          }
+        }
+      } catch (pushErr) {
+        console.error('Caregiver invite push error:', pushErr);
+      }
+
+      return res.status(201).json({ id: result.insertedId.toString(), ...inviteDoc });
+    } catch (err) {
+      console.error('Caregiver invite error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.delete('/api/family/:memberId/connected-caregivers/:caregiverUserId', authMiddleware, async (req, res) => {
+    try {
+      const requesterId = (req as any).userId;
+      const { memberId, caregiverUserId } = req.params;
+      const member = await family.findOne({ _id: toId(memberId) });
+      if (!member) return res.status(404).json({ message: 'Not found' });
+
+      const isOwner = member.userId === requesterId;
+      if (!isOwner && caregiverUserId !== requesterId) {
+        return res.status(403).json({ message: 'Forbidden' });
+      }
+
+      const connected: any[] = Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : [];
+      if (!connected.some((c: any) => c.userId === caregiverUserId)) {
+        return res.status(404).json({ message: 'Caregiver not found' });
+      }
+
+      await family.updateOne(
+        { _id: toId(memberId) },
+        { $pull: { connectedCaregivers: { userId: caregiverUserId } } as any }
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // --- Caregiver invite inbox ---
+  app.get('/api/caregiver-invites', authMiddleware, async (req, res) => {
+    try {
+      const email = ((req as any).userEmail || '').toString().toLowerCase();
+      const list = await caregiverInvites
+        .find({ inviteeEmail: email, status: 'pending' })
+        .sort({ createdAt: -1 })
+        .toArray();
+      return res.json(list.map((inv: any) => ({
+        id: inv._id.toString(),
+        memberId: inv.memberId?.toString?.() ?? inv.memberId,
+        memberName: inv.memberName,
+        memberAvatarUrl: inv.memberAvatarUrl || null,
+        invitedByName: inv.invitedByName,
+        invitedByEmail: inv.invitedByEmail,
+        inviteeEmail: inv.inviteeEmail,
+        status: inv.status,
+        createdAt: inv.createdAt,
+      })));
+    } catch (err) {
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/caregiver-invites/:inviteId/accept', authMiddleware, async (req, res) => {
+    try {
+      const requesterId = (req as any).userId;
+      const email = ((req as any).userEmail || '').toString().toLowerCase();
+      const invite = await caregiverInvites.findOne({ _id: toId(req.params.inviteId) });
+      if (!invite || invite.status !== 'pending') return res.status(404).json({ message: 'Invite not found' });
+      if (invite.inviteeEmail !== email) return res.status(403).json({ message: 'Forbidden' });
+
+      await family.updateOne(
+        { _id: toId(invite.memberId), 'connectedCaregivers.userId': { $ne: requesterId } },
+        { $push: { connectedCaregivers: { userId: requesterId, role: 'caregiver', connectedAt: new Date() } } } as any
+      );
+
+      await caregiverInvites.updateOne(
+        { _id: invite._id },
+        { $set: { status: 'accepted', respondedAt: new Date() } }
+      );
+
+      try {
+        const owner = await users.findOne({ _id: toId(invite.invitedByUserId) });
+        const acceptingUser = await users.findOne({ _id: toId(requesterId) });
+        if (owner) {
+          const messaging = getFirebaseMessaging();
+          if (messaging) {
+            const tokenDocs = await pushTokens.find({ userId: owner._id.toString() }).project({ token: 1 }).toArray();
+            const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
+            if (tokens.length) {
+              await messaging.sendEachForMulticast({
+                tokens,
+                notification: {
+                  title: 'Caregiver invite accepted',
+                  body: `${acceptingUser?.name || 'Someone'} accepted your caregiver invite for ${invite.memberName}.`,
+                },
+                data: { type: 'caregiver_invite_accepted', memberId: String(invite.memberId) },
+              });
+            }
+          }
+        }
+      } catch (pushErr) {
+        console.error('Caregiver accept push error:', pushErr);
+      }
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('Caregiver accept error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/caregiver-invites/:inviteId/decline', authMiddleware, async (req, res) => {
+    try {
+      const email = ((req as any).userEmail || '').toString().toLowerCase();
+      const invite = await caregiverInvites.findOne({ _id: toId(req.params.inviteId) });
+      if (!invite || invite.status !== 'pending') return res.status(404).json({ message: 'Invite not found' });
+      if (invite.inviteeEmail !== email) return res.status(403).json({ message: 'Forbidden' });
+
+      await caregiverInvites.updateOne(
+        { _id: invite._id },
+        { $set: { status: 'declined', respondedAt: new Date() } }
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
 
   // --- Family: Member Reminders ---
   app.get('/api/family/:id/reminders', authMiddleware, async (req, res) => {
@@ -3130,8 +3405,12 @@ CRITICAL RULES:
   app.patch('/api/family/:memberId/medicines/:medId', authMiddleware, async (req, res) => {
     try {
       const { memberId, medId } = req.params;
+      const requesterId = (req as any).userId;
       const { action } = req.body as { action: 'taken' | 'snooze' | 'skip' };
-      const member = await family.findOne({ _id: toId(memberId), userId: (req as any).userId });
+      const member = await family.findOne({
+        _id: toId(memberId),
+        $or: [{ userId: requesterId }, { 'connectedCaregivers.userId': requesterId }],
+      });
       if (!member) {
         return res.status(404).json({ message: 'Family member not found' });
       }
@@ -3196,23 +3475,48 @@ CRITICAL RULES:
       });
 
       await family.updateOne(
-        { _id: toId(memberId), userId: (req as any).userId },
+        { _id: toId(memberId) },
         { $set: { medicines: updatedMeds } },
       );
 
       // Log the event
       await medicineLogs.insertOne({
-        userId: (req as any).userId,
+        userId: requesterId,
         memberId,
         medId,
         action, // 'taken' | 'snooze' | 'skip'
         timestamp: now,
       } as any);
 
-      const updated = (await family.findOne({ _id: toId(memberId), userId: (req as any).userId })) as any;
+      const updated = (await family.findOne({ _id: toId(memberId) })) as any;
       if (!updated) {
         return res.status(500).json({ message: 'Failed to load updated member' });
       }
+
+      // Notify other connected caregivers to refetch, so a mark-done by one
+      // caregiver shows up for everyone else without waiting on their own poll.
+      try {
+        const otherRecipientIds = getRecipientUserIds(updated).filter((id) => id !== requesterId);
+        if (otherRecipientIds.length) {
+          const messaging = getFirebaseMessaging();
+          if (messaging) {
+            const tokenDocs = await pushTokens
+              .find({ userId: { $in: otherRecipientIds } })
+              .project({ token: 1 })
+              .toArray();
+            const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
+            if (tokens.length) {
+              await messaging.sendEachForMulticast({
+                tokens,
+                data: { type: 'sync', memberId, medId },
+              });
+            }
+          }
+        }
+      } catch (syncErr) {
+        console.error('Medicine sync push error:', syncErr);
+      }
+
       return res.json({
         id: updated._id.toString(),
         name: updated.name,
@@ -3224,6 +3528,16 @@ CRITICAL RULES:
       return res.status(500).json({ message: 'Server error.' });
     }
   });
+
+  // Owner + all accepted caregivers for a family member — used to fan out
+  // reminders/alerts to everyone connected, not just the owner.
+  function getRecipientUserIds(member: any): string[] {
+    const ids = new Set<string>([String(member.userId)]);
+    for (const c of Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : []) {
+      if (c?.userId) ids.add(String(c.userId));
+    }
+    return Array.from(ids);
+  }
 
   // ----- Reminder scheduler (email + in-app) -----
   const REMINDER_CHECK_INTERVAL_MS = 60_000;
@@ -3418,41 +3732,52 @@ CRITICAL RULES:
 
                 if (!withinWindow) continue;
 
-                const user = await users.findOne({ _id: toId(member.userId) });
-                if (!user) continue;
+                const recipientIds = getRecipientUserIds(member);
+                const recipientUsers = await users.find({ _id: { $in: recipientIds.map((id) => toId(id)) } }).toArray();
+                if (!recipientUsers.length) continue;
 
                 const logId = `med-${member._id}-${med.id}-${slotKey}-${doseTime.toISOString().slice(0, 10)}`;
-                const already = await reminderLogs.findOne({
-                   userId: user._id.toString(),
-                   billId: logId, // using billId field for med log uniqueness
-                   channel: 'in_app'
-                });
-                if (already) continue;
-
                 const title = `Time for ${member.name}'s medicine`;
                 const body = `Take ${med.name} (${med.dosage || '1 dose'}) - ${slotKey.charAt(0).toUpperCase() + slotKey.slice(1)}`;
                 const route = `/medicine-details/${member._id.toString()}/${med.id}`;
 
-                await notifications.insertOne({
-                  userId: user._id.toString(),
-                  type: 'reminder',
-                  title,
-                  body,
-                  read: false,
-                  createdAt: new Date(),
-                  meta: { 
-                    type: 'medication', 
-                    referenceId: med.id,
-                    memberId: member._id.toString(), 
-                    medId: med.id,
-                    route,
-                    redirectUrl: route
-                  }
-                });
+                const freshRecipients: any[] = [];
+                for (const recipient of recipientUsers) {
+                  const already = await reminderLogs.findOne({
+                    userId: recipient._id.toString(),
+                    billId: logId, // using billId field for med log uniqueness
+                    channel: 'in_app',
+                  });
+                  if (already) continue;
+                  freshRecipients.push(recipient);
+                }
+                if (!freshRecipients.length) continue;
+
+                for (const recipient of freshRecipients) {
+                  await notifications.insertOne({
+                    userId: recipient._id.toString(),
+                    type: 'reminder',
+                    title,
+                    body,
+                    read: false,
+                    createdAt: new Date(),
+                    meta: {
+                      type: 'medication',
+                      referenceId: med.id,
+                      memberId: member._id.toString(),
+                      medId: med.id,
+                      route,
+                      redirectUrl: route
+                    }
+                  });
+                }
 
                 const messaging = getFirebaseMessaging();
                 if (messaging) {
-                  const tokenDocs = await pushTokens.find({ userId: user._id.toString() }).project({ token: 1 }).toArray();
+                  const tokenDocs = await pushTokens
+                    .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
+                    .project({ token: 1 })
+                    .toArray();
                   const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
                   if (tokens.length) {
                     await messaging.sendEachForMulticast({
@@ -3463,13 +3788,15 @@ CRITICAL RULES:
                   }
                 }
 
-                await reminderLogs.insertOne({
-                  userId: user._id.toString(),
-                  billId: logId,
-                  channel: 'in_app',
-                  dayOffset: 0,
-                  sentAt: new Date()
-                });
+                for (const recipient of freshRecipients) {
+                  await reminderLogs.insertOne({
+                    userId: recipient._id.toString(),
+                    billId: logId,
+                    channel: 'in_app',
+                    dayOffset: 0,
+                    sentAt: new Date()
+                  });
+                }
               }
             } catch (medErr) {
               console.error('Med reminder error:', medErr);
@@ -3487,11 +3814,7 @@ CRITICAL RULES:
   startReminderScheduler();
 
   // ----- Emergency Alerts scheduler (missed-medicine notifications) -----
-  // NOTE: this notifies the account owner's own registered devices (via pushTokens),
-  // matching the current schema where a family member belongs to exactly one userId.
-  // "Notify a different linked co-caregiver's account" would need a family-sharing/
-  // invite schema change and is out of scope until product decides that's wanted
-  // (see the doc's open question in section 5).
+  // Notifies the owner and all accepted connected caregivers (see getRecipientUserIds).
   const EMERGENCY_CHECK_INTERVAL_MS = 15 * 60 * 1000; // every 15 minutes
 
   function findMissedMedicines(medicines: any[], thresholdHours: number): any[] {
@@ -3526,8 +3849,9 @@ CRITICAL RULES:
             const missed = findMissedMedicines((member as any).medicines, settings.missedMedicineThresholdHours);
             if (missed.length === 0) continue;
 
-            const user = await users.findOne({ _id: toId((member as any).userId) });
-            if (!user) continue;
+            const recipientIds = getRecipientUserIds(member as any);
+            const recipientUsers = await users.find({ _id: { $in: recipientIds.map((id) => toId(id)) } }).toArray();
+            if (!recipientUsers.length) continue;
 
             const title = `Missed medicine alert: ${member.name}`;
             const body = `${missed.length} dose${missed.length > 1 ? 's' : ''} missed for ${member.name}: ${missed.map((m: any) => m.name).join(', ')}`;
@@ -3545,19 +3869,24 @@ CRITICAL RULES:
               { $push: { emergencyLog: logEntry } } as any,
             );
 
-            await notifications.insertOne({
-              userId: user._id.toString(),
-              type: 'alert',
-              title,
-              body,
-              read: false,
-              createdAt: new Date(),
-              meta: { type: 'emergency', memberId: (member as any)._id.toString() },
-            } as any);
+            for (const recipient of recipientUsers) {
+              await notifications.insertOne({
+                userId: recipient._id.toString(),
+                type: 'alert',
+                title,
+                body,
+                read: false,
+                createdAt: new Date(),
+                meta: { type: 'emergency', memberId: (member as any)._id.toString() },
+              } as any);
+            }
 
             const messaging = getFirebaseMessaging();
             if (messaging) {
-              const tokenDocs = await pushTokens.find({ userId: user._id.toString() }).project({ token: 1 }).toArray();
+              const tokenDocs = await pushTokens
+                .find({ userId: { $in: recipientUsers.map((r: any) => r._id.toString()) } })
+                .project({ token: 1 })
+                .toArray();
               const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
               if (tokens.length) {
                 await messaging.sendEachForMulticast({
