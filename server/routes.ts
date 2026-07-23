@@ -84,6 +84,7 @@ const REMINDER_EMAIL_TEMPLATE = fs.existsSync(reminderTemplatePath)
 type ReminderChannel = 'email' | 'in_app';
 
 const upload = multer({ storage: multer.memoryStorage() });
+const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const s3 = new S3Client({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
@@ -1859,7 +1860,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post(
     '/api/avatar',
     authMiddleware,
-    upload.single('avatar'),
+    (req: any, res: any, next: any) => {
+      avatarUpload.single('avatar')(req, res, (err: any) => {
+        if (err?.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ message: 'Avatar image must be 5MB or smaller.' });
+        }
+        if (err) {
+          console.error('Avatar multer error:', err);
+          return res.status(400).json({ message: 'Invalid upload.' });
+        }
+        next();
+      });
+    },
     async (req: any, res: any) => {
       try {
         if (!S3_BUCKET) {
@@ -1868,6 +1880,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const file = (req as any).file;
         if (!file || !file.buffer) {
           return res.status(400).json({ message: 'avatar file is required' });
+        }
+        if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+          return res.status(400).json({ message: 'Only image files are allowed.' });
         }
 
         const key = `avatars/${(req as any).userId}/${Date.now()}-${file.originalname}`;
@@ -1878,6 +1893,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             Key: key,
             Body: file.buffer,
             ContentType: file.mimetype || 'image/jpeg',
+            ACL: 'public-read',
           } as any),
         );
 
