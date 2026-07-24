@@ -16,6 +16,7 @@ import { Server as SocketServer } from 'socket.io';
 import { SupportTicketSchema, SupportMessageSchema, type SupportTicket, type SupportMessage } from './db/support-schema';
 import { SubscriptionPlanSchema, PromoCodeSchema, type SubscriptionPlan, type PromoCode } from './db/subscription-schema';
 import { SystemSettingsSchema, type SystemSettings } from './db/system-settings-schema';
+import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId } from '../constants/plans';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -40,6 +41,7 @@ async function initIndexes() {
   const billHistory = db.collection('billHistory');
   const family = db.collection('family_members');
   const caregiverInvites = db.collection('caregiver_invites');
+  const usage = db.collection('usage');
 
   try {
     // Unique index for SMS deduplication: same user, same SMS unique ID
@@ -52,6 +54,7 @@ async function initIndexes() {
     await (family as any).createIndex({ userId: 1 });
     await (caregiverInvites as any).createIndex({ inviteeEmail: 1, status: 1 });
     await (caregiverInvites as any).createIndex({ memberId: 1 });
+    await (usage as any).createIndex({ userId: 1, yearMonth: 1 }, { unique: true });
     console.log('[DB] Indexes initialized');
   } catch (err) {
     console.error('[DB] Index initialization failed:', err);
@@ -453,6 +456,77 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const billHistory = db.collection('bill_history') as any;
   const healthReadings = db.collection('health_readings') as any;
   const caregiverInvites = db.collection('caregiver_invites') as any;
+  const usage = db.collection('usage') as any;
+
+  // --- Subscription helpers ---
+  function withSubscriptionFields(user: any) {
+    return {
+      plan: user.plan || 'free',
+      planInterval: user.planInterval || 'month',
+      planStatus: user.planStatus || 'active',
+      planRenewsAt: user.planRenewsAt || null,
+      trialStartedAt: user.trialStartedAt || null,
+      trialUsed: !!user.trialUsed,
+    };
+  }
+
+  const TRIAL_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+
+  function getEffectivePlan(user: any): PlanId {
+    const trialActive = !!user.trialStartedAt &&
+      (Date.now() - new Date(user.trialStartedAt).getTime()) < TRIAL_DURATION_MS;
+    return trialActive ? 'family' : ((user.plan || 'free') as PlanId);
+  }
+
+  function getTrialDaysRemaining(user: any): number {
+    if (!user.trialStartedAt) return 0;
+    const elapsed = Date.now() - new Date(user.trialStartedAt).getTime();
+    const remainingMs = TRIAL_DURATION_MS - elapsed;
+    return remainingMs > 0 ? Math.ceil(remainingMs / (24 * 60 * 60 * 1000)) : 0;
+  }
+
+  function currentYearMonth(): string {
+    return new Date().toISOString().slice(0, 7);
+  }
+
+  async function getOrCreateUsage(userId: string) {
+    const yearMonth = currentYearMonth();
+    const existing = await usage.findOne({ userId, yearMonth });
+    if (existing) return existing;
+    const fresh = {
+      userId,
+      yearMonth,
+      voiceReminderPerMonth: 0,
+      billScanPerMonth: 0,
+      wiseAiPerMonth: 0,
+      bankPdfImportPerMonth: 0,
+      noticeboardPostsPerMonth: 0,
+    };
+    try {
+      await usage.insertOne(fresh);
+    } catch (err) {
+      // Unique-index race: another request created it first this instant — reread.
+      const raced = await usage.findOne({ userId, yearMonth });
+      if (raced) return raced;
+      throw err;
+    }
+    return fresh;
+  }
+
+  type LimitKey = keyof typeof LIMITS.free;
+
+  async function checkLimit(userId: string, limitKey: LimitKey, currentCount: number): Promise<{ error: string; limitKey: LimitKey; recommendedPlan: PlanId } | null> {
+    const user = await users.findOne({ _id: toId(userId) });
+    if (!user) return null;
+    const effectivePlan = getEffectivePlan(user);
+    const limit = LIMITS[effectivePlan][limitKey];
+    if (limit === null || limit === undefined) return null;
+    if (currentCount >= limit) {
+      return { error: 'plan_limit', limitKey, recommendedPlan: nextPlanUp(effectivePlan) };
+    }
+    return null;
+  }
+
   console.log('[DEBUG] registerRoutes: Initializing priority routes');
 
   // --- Priority: File Uploads ---
@@ -559,6 +633,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post('/api/family', authMiddleware, async (req, res) => {
     try {
+      const requesterId = (req as any).userId;
+      const memberCount = await family.countDocuments({ userId: requesterId });
+      const limitHit = await checkLimit(requesterId, 'familyMembers', memberCount);
+      if (limitHit) return res.status(403).json(limitHit);
+
       const { name, relationship, avatarUrl, dateOfBirth, bloodGroup, phone, modules, features } = req.body;
       const doc = {
         userId: (req as any).userId,
@@ -1457,41 +1536,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const planCount = await plans.countDocuments();
       if (planCount === 0) {
-        await plans.insertMany([
-          { 
-            name: "Basic Shield", 
-            type: "basic", 
-            price: 499, 
-            interval: "month", 
-            features: ["Basic Support", "Limit to 5 Bills", "Family of 2"],
-            status: "active",
-            activeUsers: 142,
+        await plans.insertMany(
+          PLANS.map((p) => ({
+            name: p.name,
+            type: p.id,
+            price: p.priceMonthly,
+            priceYearly: p.priceYearly,
+            interval: 'month' as const,
+            features: [],
+            limits: p.limits,
+            flags: p.flags,
+            productIdMonthly: p.productIdMonthly,
+            productIdYearly: p.productIdYearly,
+            status: 'active',
+            activeUsers: 0,
             createdAt: new Date(),
-            updatedAt: new Date()
-          },
-          { 
-            name: "Premium Guard", 
-            type: "premium", 
-            price: 1299, 
-            interval: "month", 
-            features: ["Priority Support", "Unlimited Bills", "Full Family Suite", "AI Insights"],
-            status: "active",
-            activeUsers: 89,
-            createdAt: new Date(),
-            updatedAt: new Date()
-          },
-          { 
-            name: "Enterprise Core", 
-            type: "enterprise", 
-            price: 4999, 
-            interval: "year", 
-            features: ["24/7 Dedicated Agent", "Asset Management", "Legal Assistance", "Custom Reporting"],
-            status: "active",
-            activeUsers: 12,
-            createdAt: new Date(),
-            updatedAt: new Date()
-          }
-        ]);
+            updatedAt: new Date(),
+          })),
+        );
         console.log('[seed] Plans initialized');
       }
 
@@ -1578,6 +1640,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           email: user.email,
           name: user.name,
           avatarUrl: user.avatarUrl,
+          ...withSubscriptionFields(user),
         }
       });
     } catch (err) {
@@ -1609,7 +1672,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
       const result = await users.insertOne(doc);
       const userId = result.insertedId.toString();
-      const userResponse = { id: userId, email: doc.email, name: doc.name };
+      const userResponse = { id: userId, email: doc.email, name: doc.name, ...withSubscriptionFields(doc) };
       const token = jwt.sign({ userId, email: doc.email }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
       return res.status(201).json({ user: userResponse, token });
     } catch (err) {
@@ -1644,7 +1707,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const userId = (user as any)._id.toString();
       const token = jwt.sign({ userId, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
       return res.json({
-        user: { id: userId, email: user.email, name: user.name, phone: user.phone, phoneVerified: true },
+        user: { id: userId, email: user.email, name: user.name, phone: user.phone, phoneVerified: true, ...withSubscriptionFields(user) },
         token,
       });
     } catch (err) {
@@ -1688,7 +1751,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const userId = (user as any)._id.toString();
       const token = jwt.sign({ userId, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
       return res.json({
-        user: { id: userId, email: user.email, name: user.name, phone: user.phone, phoneVerified: user.phoneVerified },
+        user: { id: userId, email: user.email, name: user.name, phone: user.phone, phoneVerified: user.phoneVerified, ...withSubscriptionFields(user) },
         token,
       });
     } catch (err) {
@@ -1740,6 +1803,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           name: user.name,
           phone: (user as any).phone,
           phoneVerified: (user as any).phoneVerified ?? false,
+          ...withSubscriptionFields(user),
         },
         token,
       });
@@ -1790,6 +1854,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           phoneVerified: user.phoneVerified,
           avatarUrl: (user as any).avatarUrl || null,
           dateOfBirth: (user as any).dateOfBirth || null,
+          ...withSubscriptionFields(user),
         },
       });
     } catch (err) {
@@ -1849,10 +1914,110 @@ export async function registerRoutes(app: Express): Promise<Server> {
           phoneVerified: user.phoneVerified,
           avatarUrl: (user as any).avatarUrl,
           dateOfBirth: (user as any).dateOfBirth || null,
+          ...withSubscriptionFields(user),
         },
       });
     } catch (err) {
       console.error('Update me error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // --- Subscription / Plans (customer-facing) ---
+  app.get('/api/plans', async (req, res) => {
+    return res.json(PLANS);
+  });
+
+  app.get('/api/subscription/me', authMiddleware, async (req, res) => {
+    try {
+      const userId = (req as any).userId;
+      const user = await users.findOne({ _id: toId(userId) });
+      if (!user) return res.status(404).json({ message: 'User not found' });
+      const effectivePlan = getEffectivePlan(user);
+      const usageDoc = await getOrCreateUsage(userId);
+      return res.json({
+        ...withSubscriptionFields(user),
+        effectivePlan,
+        trialDaysRemaining: getTrialDaysRemaining(user),
+        usage: {
+          voiceReminderPerMonth: usageDoc.voiceReminderPerMonth,
+          billScanPerMonth: usageDoc.billScanPerMonth,
+          wiseAiPerMonth: usageDoc.wiseAiPerMonth,
+          bankPdfImportPerMonth: usageDoc.bankPdfImportPerMonth,
+          noticeboardPostsPerMonth: usageDoc.noticeboardPostsPerMonth,
+        },
+        limits: LIMITS[effectivePlan],
+        flags: FLAGS[effectivePlan],
+      });
+    } catch (err) {
+      console.error('Subscription me error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/subscription/trial', authMiddleware, async (req, res) => {
+    try {
+      const userId = (req as any).userId;
+      const user = await users.findOne({ _id: toId(userId) });
+      if (!user) return res.status(404).json({ message: 'User not found' });
+      if (user.trialUsed) {
+        return res.status(409).json({ message: 'Trial has already been used' });
+      }
+      const trialStartedAt = new Date();
+      await users.updateOne({ _id: toId(userId) }, { $set: { trialStartedAt, trialUsed: true } });
+      return res.json({ ok: true, trialStartedAt });
+    } catch (err) {
+      console.error('Subscription trial error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  const USAGE_KEYS = ['voiceReminderPerMonth', 'billScanPerMonth', 'wiseAiPerMonth', 'bankPdfImportPerMonth', 'noticeboardPostsPerMonth'] as const;
+
+  app.post('/api/subscription/usage', authMiddleware, async (req, res) => {
+    try {
+      const userId = (req as any).userId;
+      const { key } = req.body as { key?: string };
+      if (!key || !(USAGE_KEYS as readonly string[]).includes(key)) {
+        return res.status(400).json({ message: `key must be one of: ${USAGE_KEYS.join(', ')}` });
+      }
+      const existing = await getOrCreateUsage(userId);
+      const yearMonth = currentYearMonth();
+      const count = (Number(existing[key]) || 0) + 1;
+      await usage.updateOne({ userId, yearMonth }, { $set: { [key]: count } });
+
+      const user = await users.findOne({ _id: toId(userId) });
+      const effectivePlan = user ? getEffectivePlan(user) : 'free';
+      const limit = (LIMITS[effectivePlan] as any)[key];
+      const exceeded = limit !== null && limit !== undefined && count > limit;
+
+      return res.json({ count, limit: limit ?? null, exceeded });
+    } catch (err) {
+      console.error('Subscription usage error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/subscription/purchase', authMiddleware, async (req, res) => {
+    try {
+      const userId = (req as any).userId;
+      const { planId, interval } = req.body as { planId?: string; interval?: string };
+      const plan = planId ? getPlanById(planId) : undefined;
+      if (!plan) {
+        return res.status(400).json({ message: `planId must be one of: ${PLAN_ORDER.join(', ')}` });
+      }
+      if (interval !== 'month' && interval !== 'year') {
+        return res.status(400).json({ message: 'interval must be "month" or "year"' });
+      }
+      const now = Date.now();
+      const renewsAt = new Date(interval === 'year' ? now + 365 * 24 * 60 * 60 * 1000 : now + 30 * 24 * 60 * 60 * 1000);
+      await users.updateOne(
+        { _id: toId(userId) },
+        { $set: { plan: plan.id, planInterval: interval, planStatus: 'active', planRenewsAt: renewsAt } },
+      );
+      return res.json({ ok: true, plan: plan.id, planInterval: interval, planRenewsAt: renewsAt });
+    } catch (err) {
+      console.error('Subscription purchase error:', err);
       return res.status(500).json({ message: 'Server error.' });
     }
   });
@@ -2167,6 +2332,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post('/api/bills', authMiddleware, async (req, res) => {
     try {
+      const requesterId = (req as any).userId;
+      const billCount = await bills.countDocuments({ userId: requesterId });
+      const limitHit = await checkLimit(requesterId, 'reminders', billCount);
+      if (limitHit) return res.status(403).json(limitHit);
+
       const body = req.body;
       const doc = {
         userId: (req as any).userId,
@@ -2384,6 +2554,11 @@ RULES: ONLY valid JSON, no explanation.
   // Scan Bill Commit (create a bill reminder from validated preview)
   app.post('/api/bills/scan/commit', authMiddleware, async (req: any, res: any) => {
     try {
+      const requesterId = (req as any).userId;
+      const scanUsage = await getOrCreateUsage(requesterId);
+      const limitHit = await checkLimit(requesterId, 'billScanPerMonth', scanUsage.billScanPerMonth);
+      if (limitHit) return res.status(403).json(limitHit);
+
       const preview = req.body?.preview;
       if (!preview) return res.status(400).json({ message: 'preview is required' });
 
@@ -2423,6 +2598,13 @@ RULES: ONLY valid JSON, no explanation.
       };
 
       const result = await bills.insertOne(doc);
+
+      const scanYearMonth = currentYearMonth();
+      await usage.updateOne(
+        { userId: requesterId, yearMonth: scanYearMonth },
+        { $set: { billScanPerMonth: (Number(scanUsage.billScanPerMonth) || 0) + 1 } },
+      );
+
       return res.status(201).json({ id: result.insertedId.toString(), ...doc });
     } catch (err) {
       console.error('Scan bill commit error:', err);
@@ -2654,12 +2836,17 @@ RULES: ONLY valid JSON, no explanation.
         if (!openAIKey) {
           return res.status(500).json({ message: 'Voice is not configured. Set OPENAI_API_KEY.' });
         }
-  
+
+        const requesterId = (req as any).userId;
+        const voiceUsage = await getOrCreateUsage(requesterId);
+        const limitHit = await checkLimit(requesterId, 'voiceReminderPerMonth', voiceUsage.voiceReminderPerMonth);
+        if (limitHit) return res.status(403).json(limitHit);
+
         const file = (req as any).file;
         if (!file || !file.buffer) {
           return res.status(400).json({ message: 'audio file is required' });
         }
-  
+
         const MODEL = OPENAI_TRANSCRIBE_MODEL;
         const PROMPT = [
           'The speaker may use English, Hindi, or Gujarati.',
@@ -2715,6 +2902,12 @@ RULES: ONLY valid JSON, no explanation.
         });
 
         const parsed = await normalizeAndParseVoiceReminderWithAI(normalized.text, normalized.language);
+
+        const voiceYearMonth = currentYearMonth();
+        await usage.updateOne(
+          { userId: requesterId, yearMonth: voiceYearMonth },
+          { $set: { voiceReminderPerMonth: (Number(voiceUsage.voiceReminderPerMonth) || 0) + 1 } },
+        );
 
         return res.json({
           text: parsed.normalizedText,
@@ -3205,6 +3398,11 @@ JSON Output:`;
         return res.status(500).json({ message: 'Assistant is not configured. Set OPENAI_API_KEY.' });
       }
 
+      const requesterId = (req as any).userId;
+      const wiseAiUsage = await getOrCreateUsage(requesterId);
+      const limitHit = await checkLimit(requesterId, 'wiseAiPerMonth', wiseAiUsage.wiseAiPerMonth);
+      if (limitHit) return res.status(403).json(limitHit);
+
       const body = req.body as {
         messages: { role: 'system' | 'user' | 'assistant'; content: string }[];
       };
@@ -3320,6 +3518,12 @@ CRITICAL RULES:
 
       const json = await aiRes.json();
       const reply = json.choices?.[0]?.message?.content || 'Sorry, I could not generate a response right now.';
+
+      const yearMonth = currentYearMonth();
+      await usage.updateOne(
+        { userId: requesterId, yearMonth },
+        { $set: { wiseAiPerMonth: (Number(wiseAiUsage.wiseAiPerMonth) || 0) + 1 } },
+      );
 
       return res.json({ reply });
 
@@ -4265,6 +4469,31 @@ CRITICAL RULES:
     } catch (err) {
       console.error('Admin plans create error:', err);
       res.status(500).json({ message: 'Failed to create plan' });
+    }
+  });
+
+  app.put('/api/admin/plans/:id', adminAuthMiddleware, async (req, res) => {
+    try {
+      const update = { ...req.body, updatedAt: new Date() };
+      delete update._id;
+      const result = await plans.updateOne({ _id: toId(req.params.id) }, { $set: update });
+      if (result.matchedCount === 0) return res.status(404).json({ message: 'Plan not found' });
+      const updated = await plans.findOne({ _id: toId(req.params.id) });
+      res.json(updated);
+    } catch (err) {
+      console.error('Admin plans update error:', err);
+      res.status(500).json({ message: 'Failed to update plan' });
+    }
+  });
+
+  app.delete('/api/admin/plans/:id', adminAuthMiddleware, async (req, res) => {
+    try {
+      const result = await plans.deleteOne({ _id: toId(req.params.id) });
+      if (result.deletedCount === 0) return res.status(404).json({ message: 'Plan not found' });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('Admin plans delete error:', err);
+      res.status(500).json({ message: 'Failed to delete plan' });
     }
   });
 

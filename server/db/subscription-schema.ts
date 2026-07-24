@@ -1,12 +1,33 @@
 import { z } from "zod";
 import { ObjectId } from "mongodb";
 
+const PlanLimitsSchema = z.object({
+  familyMembers: z.number().nullable(),
+  reminders: z.number().nullable(),
+  wiseAiPerMonth: z.number().nullable(),
+  billScanPerMonth: z.number().nullable(),
+  voiceReminderPerMonth: z.number().nullable(),
+  bankPdfImportPerMonth: z.number().nullable(),
+  noticeboardPostsPerMonth: z.number().nullable(),
+});
+
+const PlanFlagsSchema = z.object({
+  pdfReports: z.boolean(),
+  prioritySupport: z.boolean(),
+  caregiverSharing: z.boolean(),
+});
+
 export const SubscriptionPlanSchema = z.object({
   name: z.string(),
-  type: z.enum(["basic", "premium", "enterprise"]),
+  type: z.enum(["free", "starter", "family", "pro"]),
   price: z.number(),
+  priceYearly: z.number().default(0),
   interval: z.enum(["month", "year"]),
   features: z.array(z.string()),
+  limits: PlanLimitsSchema.optional(),
+  flags: PlanFlagsSchema.optional(),
+  productIdMonthly: z.string().nullable().default(null),
+  productIdYearly: z.string().nullable().default(null),
   status: z.enum(["active", "inactive"]).default("active"),
   activeUsers: z.number().default(0),
   createdAt: z.date().default(() => new Date()),
