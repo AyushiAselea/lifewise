@@ -2085,6 +2085,55 @@ export async function registerRoutes(app: Express): Promise<Server> {
     },
   );
 
+  app.post(
+    '/api/uploads/receipt',
+    authMiddleware,
+    (req: any, res: any, next: any) => {
+      avatarUpload.single('receipt')(req, res, (err: any) => {
+        if (err?.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ message: 'Receipt image must be 5MB or smaller.' });
+        }
+        if (err) {
+          console.error('Receipt multer error:', err);
+          return res.status(400).json({ message: 'Invalid upload.' });
+        }
+        next();
+      });
+    },
+    async (req: any, res: any) => {
+      try {
+        if (!S3_BUCKET) {
+          return res.status(500).json({ message: 'S3 bucket not configured. Set AWS_S3_BUCKET.' });
+        }
+        const file = (req as any).file;
+        if (!file || !file.buffer) {
+          return res.status(400).json({ message: 'receipt file is required' });
+        }
+        if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+          return res.status(400).json({ message: 'Only image files are allowed.' });
+        }
+
+        const key = `receipts/${(req as any).userId}/${Date.now()}-${file.originalname}`;
+
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: S3_BUCKET,
+            Key: key,
+            Body: file.buffer,
+            ContentType: file.mimetype || 'image/jpeg',
+            ACL: 'public-read',
+          } as any),
+        );
+
+        const url = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+        return res.status(201).json({ url });
+      } catch (err) {
+        console.error('Upload receipt error:', err);
+        return res.status(500).json({ message: 'Server error.' });
+      }
+    },
+  );
+
   // ----- In-app notifications -----
   app.get('/api/notifications', authMiddleware, async (req, res) => {
     try {
