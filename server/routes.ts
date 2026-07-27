@@ -62,6 +62,8 @@ async function initIndexes() {
 }
 
 type CategoryType = 'health' | 'bills' | 'family' | 'work' | 'tasks' | 'subscriptions' | 'finance' | 'habits' | 'travel' | 'events' | 'food' | 'shopping' | 'transport' | 'entertainment' | 'education' | 'investment' | 'others';
+type PaymentMode = 'upi' | 'cash' | 'card' | 'netbanking';
+const PAYMENT_MODES: PaymentMode[] = ['upi', 'cash', 'card', 'netbanking'];
 type ReminderType = 'bill' | 'subscription' | 'custom';
 type RepeatType = 'none' | 'daily' | 'weekly' | 'monthly' | 'yearly';
 type ReminderStatus = 'active' | 'paid' | 'snoozed';
@@ -2181,6 +2183,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         upiId: t.upiId || '',
         isDebit: t.isDebit !== false,
         description: t.description || '',
+        memberId: t.memberId || null,
+        paymentMode: (t.paymentMode as PaymentMode) || 'upi',
+        receiptUrl: t.receiptUrl || '',
+        source: t.source || 'manual',
       }));
       return res.json(out);
     } catch (err) {
@@ -2191,12 +2197,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post('/api/transactions', authMiddleware, async (req, res) => {
     try {
-      const { merchant, amount, category, date, upiId, isDebit, description } = req.body;
+      const { merchant, amount, category, date, upiId, isDebit, description, memberId, paymentMode, receiptUrl, source } = req.body;
       if (!merchant || amount == null) {
         return res.status(400).json({ message: 'merchant and amount are required' });
       }
+
+      const userId = (req as any).userId;
+      let resolvedMemberId: string | null = null;
+      if (memberId) {
+        const member = await family.findOne({ _id: toId(memberId), userId });
+        resolvedMemberId = member ? String(memberId) : null;
+      }
+
       const doc = {
-        userId: (req as any).userId,
+        userId,
         merchant: String(merchant),
         amount: Number(amount),
         category: (category as CategoryType) || 'others',
@@ -2204,6 +2218,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         upiId: upiId || '',
         isDebit: isDebit !== false,
         description: description || '',
+        memberId: resolvedMemberId,
+        paymentMode: PAYMENT_MODES.includes(paymentMode) ? (paymentMode as PaymentMode) : 'upi',
+        receiptUrl: receiptUrl || '',
+        source: source || 'manual',
       };
       const result = await transactions.insertOne(doc);
       return res.status(201).json({
