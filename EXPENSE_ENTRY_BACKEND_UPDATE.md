@@ -1,8 +1,8 @@
 # Expense Entry Backend Update — Frontend Guide
 
 **Audience:** Frontend team
-**Status:** All three items below are committed and pushed to `main`. Render deploy is currently paused on the account side, so nothing is live yet — will go out automatically the next time the service is resumed. Each item was tested locally against the real production database (demo account, cleaned up after) before pushing.
-**Route base:** `/api/transactions`, `/api/recurring`
+**Status:** All six items below are committed and pushed to `main`. Render deploy is currently paused on the account side, so nothing is live yet — will go out automatically the next time the service is resumed. Each item was tested locally against the real production database and, for §6, the real S3 bucket (demo account, all test data cleaned up after) before pushing.
+**Route base:** `/api/transactions`, `/api/recurring`, `/api/uploads`
 
 Responds to the backend items requested in `LifeWise_Product_Logic_with_Timeline.pdf` §1–2 for iOS expense entry (Quick Add, receipt scan, voice input, recurring templates).
 
@@ -59,6 +59,59 @@ RecurringExpense {
 
 ---
 
-## Next up (backend side)
+## 4. Bulk transaction endpoint (for import)
 
-§3 (bulk transaction endpoint), §4 (statement import parsing), and §6 (receipt image upload) are next in the backend queue — will follow up with a separate note once those land.
+```
+POST /api/transactions/bulk
+{ "transactions": [ { ...same shape as §1, plus optional dedupeKey }, ... ] }
+
+→ 200 { "saved": 187, "skipped": 13, "failed": 0 }
+```
+
+Same field handling as the single-transaction route (`memberId` validated in one batched lookup, `paymentMode` whitelisted, invalid rows counted in `failed` without aborting the rest). `skipped` counts rows that matched an existing `dedupeKey`. `source` defaults to `"import"` here (vs `"manual"` on the single-row route) if you don't send one.
+
+**Action for you:** `addTransactionsBulk()` in `lib/expense-context.tsx` currently posts one request per row in chunks of 5 — swap it to a single call to this endpoint. This is the ~10-line frontend change the product doc flagged as the one exception to "no frontend change needed."
+
+---
+
+## 5. CSV statement import — preview endpoint
+
+```
+POST /api/transactions/import/preview     multipart: file=<csv>
+
+→ 200 {
+    "rows": [ { "date", "description", "amount", "isDebit", "suggestedCategory", "dedupeKey" } ],
+    "meta": { "format": "csv", "rowsFound": 42, "rowsSkipped": 0, "confidence": "high", "dateRange": { "from", "to" } }
+  }
+→ 422 { "message": "Could not read this statement. Try the CSV export instead." }
+```
+
+**CSV only in this pass** — PDF/XLS uploads currently get the same `422` fallback message. This matches the product doc's own assessment that CSV works reliably across every bank while PDF needs a separate per-bank effort (scoped to HDFC/ICICI later); shipping CSV first avoids a half-working PDF parser blocking the whole feature.
+
+- Handles quoted fields (so `"UBER, INDIA"` with an embedded comma parses as one field, not two), common Indian date formats (`DD/MM/YYYY`), and both statement layouts: separate Debit/Withdrawal + Credit/Deposit columns, or a single Amount column with a Type/Dr-Cr column.
+- `suggestedCategory` comes from the same AI categorizer used elsewhere in the backend (`categorizeTransactionsWithAI`) — if `OPENAI_API_KEY` isn't configured, every row falls back to `"others"` rather than erroring.
+- **Read-only.** Nothing is written to the database by this call. Let the user review and uncheck rows, then commit the kept ones through §4's bulk endpoint (each row already carries its `dedupeKey`, computed the same way as the client-side formula in the original spec — `sha1(date|merchant|amount_paise)` — so you don't need to recompute it).
+- The iOS Share Sheet integration to receive a PDF/CSV shared from a banking app (`CFBundleDocumentTypes` in `app.json`) is frontend/config work, not covered here.
+
+---
+
+## 6. Receipt image upload
+
+```
+POST /api/uploads/receipt     multipart: receipt=<image>
+
+→ 201 { "url": "https://lifewise-storage.s3.us-east-1.amazonaws.com/receipts/<userId>/<timestamp>-<filename>" }
+→ 400 { "message": "Only image files are allowed." }        (non-image MIME type)
+→ 400 { "message": "Receipt image must be 5MB or smaller." } (oversized file)
+```
+
+Direct upload (not a presigned-URL flow) — same shape as the existing avatar upload route. Send the multipart image, get back a public URL, then send that URL as `receiptUrl` on `POST /api/transactions` (or in a bulk row).
+
+**Action for you:** wire this into `QuickAddSheet.tsx` / `scan-bill.tsx` wherever "Receipt Photo — optional" is offered. No UI depended on this before, so nothing breaks by not doing it yet.
+
+---
+
+## Not done in this pass
+
+- PDF statement parsing (HDFC/ICICI tabular formats) and password-protected SBI PDFs — deferred per the product doc's own sequencing; CSV path above covers the near-term need.
+- iOS Share Sheet config for receiving shared PDFs/CSVs — frontend/`app.json` work, not backend.
