@@ -17,6 +17,8 @@ import { SupportTicketSchema, SupportMessageSchema, type SupportTicket, type Sup
 import { SubscriptionPlanSchema, PromoCodeSchema, type SubscriptionPlan, type PromoCode } from './db/subscription-schema';
 import { SystemSettingsSchema, type SystemSettings } from './db/system-settings-schema';
 import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId } from '../constants/plans';
+import { parseBankCsv } from './csv-import';
+import { categorizeTransactionsWithAI } from './categorization-utils';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -100,6 +102,7 @@ type ReminderChannel = 'email' | 'in_app';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const statementUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const s3 = new S3Client({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
@@ -2306,6 +2309,88 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.status(500).json({ message: 'Server error.' });
     }
   });
+
+  // Statement import preview — CSV only for now (near-100% accurate across every
+  // bank per the product doc's own assessment; PDF parsing is a separate, deferred
+  // effort scoped to HDFC/ICICI). Read-only: never writes to the database. The
+  // client reviews/unchecks rows, then commits the kept ones via POST /api/transactions/bulk.
+  app.post(
+    '/api/transactions/import/preview',
+    authMiddleware,
+    (req: any, res: any, next: any) => {
+      statementUpload.single('file')(req, res, (err: any) => {
+        if (err?.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ message: 'File must be 10MB or smaller.' });
+        }
+        if (err) {
+          console.error('Import preview multer error:', err);
+          return res.status(400).json({ message: 'Invalid upload.' });
+        }
+        next();
+      });
+    },
+    async (req: any, res: any) => {
+      try {
+        const file = (req as any).file;
+        if (!file || !file.buffer) {
+          return res.status(400).json({ message: 'file is required' });
+        }
+
+        const isCsv = /\.csv$/i.test(file.originalname || '') || file.mimetype === 'text/csv';
+        if (!isCsv) {
+          return res.status(422).json({ message: 'Could not read this statement. Try the CSV export instead.' });
+        }
+
+        const text = file.buffer.toString('utf-8');
+        const { rows, rowsSkipped } = parseBankCsv(text);
+
+        if (rows.length === 0) {
+          return res.status(422).json({ message: 'Could not read this statement. Try the CSV export instead.' });
+        }
+
+        const openAIKey = getOpenAIKey();
+        const categories: string[] = [];
+        if (openAIKey) {
+          const batchSize = 10;
+          for (let i = 0; i < rows.length; i += batchSize) {
+            const batch = rows.slice(i, i + batchSize);
+            const batchCategories = await categorizeTransactionsWithAI(
+              batch.map((r) => ({ merchant: r.description, description: r.description })),
+              openAIKey,
+            );
+            categories.push(...batchCategories);
+          }
+        }
+
+        const dates = rows.map((r) => new Date(r.date).getTime());
+        const outRows = rows.map((r, i) => ({
+          date: r.date,
+          description: r.description,
+          amount: r.amount,
+          isDebit: r.isDebit,
+          suggestedCategory: categories[i] || 'others',
+          dedupeKey: r.dedupeKey,
+        }));
+
+        return res.json({
+          rows: outRows,
+          meta: {
+            format: 'csv',
+            rowsFound: outRows.length,
+            rowsSkipped,
+            confidence: rowsSkipped === 0 ? 'high' : 'medium',
+            dateRange: {
+              from: new Date(Math.min(...dates)).toISOString(),
+              to: new Date(Math.max(...dates)).toISOString(),
+            },
+          },
+        });
+      } catch (err) {
+        console.error('Import preview error:', err);
+        return res.status(500).json({ message: 'Server error.' });
+      }
+    },
+  );
 
   // Bulk transaction insert (statement/CSV import) — same shape as POST /api/transactions,
   // upserting on dedupeKey when present so overlapping re-imports don't duplicate rows.
