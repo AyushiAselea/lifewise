@@ -2258,6 +2258,86 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Bulk transaction insert (statement/CSV import) — same shape as POST /api/transactions,
+  // upserting on dedupeKey when present so overlapping re-imports don't duplicate rows.
+  app.post('/api/transactions/bulk', authMiddleware, async (req, res) => {
+    try {
+      const { transactions: txs } = req.body;
+      if (!Array.isArray(txs) || txs.length === 0) {
+        return res.json({ saved: 0, skipped: 0, failed: 0 });
+      }
+
+      const userId = (req as any).userId;
+      const memberIds = Array.from(
+        new Set(txs.map((t) => t.memberId).filter((id) => !!id)),
+      );
+      const validMembers = memberIds.length
+        ? await family.find({ userId, _id: { $in: memberIds.map((id) => toId(id)) } }).toArray()
+        : [];
+      const validMemberIdSet = new Set(validMembers.map((m: any) => m._id.toString()));
+
+      let failed = 0;
+      const ops = txs
+        .map((t) => {
+          if (!t.merchant || t.amount == null) {
+            failed++;
+            return null;
+          }
+          const dedupeKey = t.dedupeKey ? String(t.dedupeKey) : null;
+          const doc: Record<string, any> = {
+            userId,
+            merchant: String(t.merchant),
+            amount: Number(t.amount),
+            category: (t.category as CategoryType) || 'others',
+            date: t.date ? new Date(t.date).toISOString() : new Date().toISOString(),
+            upiId: t.upiId || '',
+            isDebit: t.isDebit !== false,
+            description: t.description || '',
+            memberId: t.memberId && validMemberIdSet.has(String(t.memberId)) ? String(t.memberId) : null,
+            paymentMode: PAYMENT_MODES.includes(t.paymentMode) ? (t.paymentMode as PaymentMode) : 'upi',
+            receiptUrl: t.receiptUrl || '',
+            source: t.source || 'import',
+          };
+
+          if (dedupeKey) {
+            doc.dedupeKey = dedupeKey;
+            return {
+              updateOne: {
+                filter: { userId, dedupeKey },
+                update: { $setOnInsert: doc },
+                upsert: true,
+              },
+            };
+          }
+          return { insertOne: { document: doc } };
+        })
+        .filter((op): op is NonNullable<typeof op> => op !== null);
+
+      let result: any = { upsertedCount: 0, insertedCount: 0 };
+      if (ops.length > 0) {
+        try {
+          result = await (transactions as any).bulkWrite(ops, { ordered: false });
+        } catch (err: any) {
+          // Duplicate-key errors from the unordered batch just mean "already imported" —
+          // the rest of the batch still committed.
+          if (err?.code === 11000 || err?.writeErrors) {
+            result = err.result ?? err;
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      const saved = (result.upsertedCount || 0) + (result.insertedCount || 0);
+      const skipped = ops.length - saved;
+
+      return res.json({ saved, skipped, failed });
+    } catch (err) {
+      console.error('Bulk transaction error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
   // Sync transactions from SMS (app reads SMS, parses, sends here)
   app.post('/api/transactions/sync-from-sms', authMiddleware, async (req, res) => {
     try {
