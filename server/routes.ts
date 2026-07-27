@@ -46,6 +46,8 @@ async function initIndexes() {
   try {
     // Unique index for SMS deduplication: same user, same SMS unique ID
     await (transactions as any).createIndex({ userId: 1, smsId: 1 }, { unique: true, partialFilterExpression: { smsId: { $exists: true } } });
+    // Unique index for import/bulk deduplication: same user, same dedupe key
+    await (transactions as any).createIndex({ userId: 1, dedupeKey: 1 }, { unique: true, partialFilterExpression: { dedupeKey: { $exists: true } } });
     // Index for common queries
     await (transactions as any).createIndex({ userId: 1, date: -1 });
     await (bills as any).createIndex({ userId: 1 });
@@ -2187,6 +2189,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         paymentMode: (t.paymentMode as PaymentMode) || 'upi',
         receiptUrl: t.receiptUrl || '',
         source: t.source || 'manual',
+        dedupeKey: t.dedupeKey || undefined,
       }));
       return res.json(out);
     } catch (err) {
@@ -2197,7 +2200,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post('/api/transactions', authMiddleware, async (req, res) => {
     try {
-      const { merchant, amount, category, date, upiId, isDebit, description, memberId, paymentMode, receiptUrl, source } = req.body;
+      const { merchant, amount, category, date, upiId, isDebit, description, memberId, paymentMode, receiptUrl, source, dedupeKey } = req.body;
       if (!merchant || amount == null) {
         return res.status(400).json({ message: 'merchant and amount are required' });
       }
@@ -2209,7 +2212,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         resolvedMemberId = member ? String(memberId) : null;
       }
 
-      const doc = {
+      const doc: Record<string, any> = {
         userId,
         merchant: String(merchant),
         amount: Number(amount),
@@ -2223,6 +2226,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         receiptUrl: receiptUrl || '',
         source: source || 'manual',
       };
+
+      if (dedupeKey) {
+        doc.dedupeKey = String(dedupeKey);
+        await (transactions as any).updateOne(
+          { userId, dedupeKey: doc.dedupeKey },
+          { $setOnInsert: doc },
+          { upsert: true },
+        );
+        const saved = await transactions.findOne({ userId, dedupeKey: doc.dedupeKey });
+        return res.status(201).json({ id: saved!._id.toString(), ...saved });
+      }
+
       const result = await transactions.insertOne(doc);
       return res.status(201).json({
         id: result.insertedId.toString(),
