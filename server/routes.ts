@@ -32,6 +32,13 @@ function toId(id: any): any {
   return /^[a-f0-9]{24}$/i.test(cleanId) ? new ObjectId(cleanId) : cleanId;
 }
 
+// Clamps to the last day of the given month instead of rolling into the next
+// month (a template set to the 31st fires on Feb 28, never Mar 3).
+function clampDayOfMonth(day: number, year: number, monthIndex: number): number {
+  const lastDay = new Date(year, monthIndex + 1, 0).getDate();
+  return Math.min(Math.max(1, day), lastDay);
+}
+
 async function initIndexes() {
   const db = getDb();
   if (!db) return;
@@ -57,6 +64,7 @@ async function initIndexes() {
     await (caregiverInvites as any).createIndex({ inviteeEmail: 1, status: 1 });
     await (caregiverInvites as any).createIndex({ memberId: 1 });
     await (usage as any).createIndex({ userId: 1, yearMonth: 1 }, { unique: true });
+    await (db.collection('recurring_expenses') as any).createIndex({ userId: 1 });
     console.log('[DB] Indexes initialized');
   } catch (err) {
     console.error('[DB] Index initialization failed:', err);
@@ -461,6 +469,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const healthReadings = db.collection('health_readings') as any;
   const caregiverInvites = db.collection('caregiver_invites') as any;
   const usage = db.collection('usage') as any;
+  const recurringExpenses = db.collection('recurring_expenses') as any;
 
   // --- Subscription helpers ---
   function withSubscriptionFields(user: any) {
@@ -2318,6 +2327,129 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     } catch (err) {
       console.error('Sync from SMS error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // ----- Recurring Expense Templates -----
+  function toRecurringDto(r: any) {
+    return {
+      id: r._id.toString(),
+      name: r.name,
+      amount: r.amount,
+      category: r.category,
+      dayOfMonth: r.dayOfMonth,
+      memberId: r.memberId || null,
+      paymentMode: (r.paymentMode as PaymentMode) || undefined,
+      lastHandledPeriod: r.lastHandledPeriod || null,
+      createdAt: r.createdAt,
+    };
+  }
+
+  app.get('/api/recurring', authMiddleware, async (req, res) => {
+    try {
+      const list = await recurringExpenses.find({ userId: (req as any).userId }).sort({ createdAt: -1 }).toArray();
+      return res.json(list.map(toRecurringDto));
+    } catch (err) {
+      console.error('Get recurring error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/recurring', authMiddleware, async (req, res) => {
+    try {
+      const { name, amount, category, dayOfMonth, memberId, paymentMode } = req.body;
+      if (!name || amount == null || dayOfMonth == null) {
+        return res.status(400).json({ message: 'name, amount and dayOfMonth are required' });
+      }
+
+      const userId = (req as any).userId;
+      let resolvedMemberId: string | null = null;
+      if (memberId) {
+        const member = await family.findOne({ _id: toId(memberId), userId });
+        resolvedMemberId = member ? String(memberId) : null;
+      }
+
+      const now = new Date();
+      const doc = {
+        userId,
+        name: String(name).trim(),
+        amount: Number(amount),
+        category: (category as CategoryType) || 'others',
+        dayOfMonth: clampDayOfMonth(Number(dayOfMonth), now.getFullYear(), now.getMonth()),
+        memberId: resolvedMemberId,
+        paymentMode: PAYMENT_MODES.includes(paymentMode) ? (paymentMode as PaymentMode) : undefined,
+        lastHandledPeriod: null,
+        createdAt: now,
+      };
+      const result = await recurringExpenses.insertOne(doc);
+      return res.status(201).json(toRecurringDto({ _id: result.insertedId, ...doc }));
+    } catch (err) {
+      console.error('Post recurring error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.put('/api/recurring/:id', authMiddleware, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const userId = (req as any).userId;
+      const { name, amount, category, dayOfMonth, memberId, paymentMode } = req.body;
+
+      const update: Record<string, any> = {};
+      if (name !== undefined) update.name = String(name).trim();
+      if (amount !== undefined) update.amount = Number(amount);
+      if (category !== undefined) update.category = category as CategoryType;
+      if (dayOfMonth !== undefined) {
+        const now = new Date();
+        update.dayOfMonth = clampDayOfMonth(Number(dayOfMonth), now.getFullYear(), now.getMonth());
+      }
+      if (paymentMode !== undefined) {
+        update.paymentMode = PAYMENT_MODES.includes(paymentMode) ? (paymentMode as PaymentMode) : undefined;
+      }
+      if (memberId !== undefined) {
+        if (memberId) {
+          const member = await family.findOne({ _id: toId(memberId), userId });
+          update.memberId = member ? String(memberId) : null;
+        } else {
+          update.memberId = null;
+        }
+      }
+
+      const result = await recurringExpenses.updateOne({ _id: toId(id), userId }, { $set: update });
+      if (result.matchedCount === 0) return res.status(404).json({ message: 'Not found' });
+      const updated = await recurringExpenses.findOne({ _id: toId(id) });
+      if (!updated) return res.status(404).json({ message: 'Not found' });
+      return res.json(toRecurringDto(updated));
+    } catch (err) {
+      console.error('Put recurring error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.delete('/api/recurring/:id', authMiddleware, async (req, res) => {
+    try {
+      const result = await recurringExpenses.deleteOne({ _id: toId(req.params.id), userId: (req as any).userId });
+      if (result.deletedCount === 0) return res.status(404).json({ message: 'Not found' });
+      return res.status(204).send();
+    } catch (err) {
+      console.error('Delete recurring error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  app.post('/api/recurring/:id/handled', authMiddleware, async (req, res) => {
+    try {
+      const { period } = req.body;
+      if (!period) return res.status(400).json({ message: 'period is required' });
+      const result = await recurringExpenses.updateOne(
+        { _id: toId(req.params.id), userId: (req as any).userId },
+        { $set: { lastHandledPeriod: String(period) } },
+      );
+      if (result.matchedCount === 0) return res.status(404).json({ message: 'Not found' });
+      return res.status(204).send();
+    } catch (err) {
+      console.error('Handle recurring error:', err);
       return res.status(500).json({ message: 'Server error.' });
     }
   });
