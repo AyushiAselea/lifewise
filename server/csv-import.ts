@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 // Minimal RFC4180-aware CSV parser: handles quoted fields, embedded commas,
 // escaped quotes (""), and newlines inside quoted fields.
 export function parseCsv(text: string): string[][] {
@@ -113,8 +115,7 @@ function computeDedupeKey(dateIso: string, description: string, amountRupees: nu
   const day = dateIso.slice(0, 10);
   const normalizedMerchant = description.trim().toLowerCase().replace(/\s+/g, ' ');
   const amountPaise = Math.round(amountRupees * 100);
-  const crypto = require('node:crypto') as typeof import('node:crypto');
-  return crypto.createHash('sha1').update(`${day}|${normalizedMerchant}|${amountPaise}`).digest('hex');
+  return createHash('sha1').update(`${day}|${normalizedMerchant}|${amountPaise}`).digest('hex');
 }
 
 export function parseBankCsv(text: string): CsvParseResult {
