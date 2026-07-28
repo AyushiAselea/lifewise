@@ -45,15 +45,22 @@ export function parseCsv(text: string): string[][] {
   return rows.filter((r) => r.some((cell) => cell.trim() !== ''));
 }
 
-const DATE_HEADERS = ['date', 'txn date', 'transaction date', 'value date'];
-const DESC_HEADERS = ['description', 'narration', 'particulars', 'details', 'remarks'];
-const DEBIT_HEADERS = ['debit', 'withdrawal', 'withdrawal amt', 'debit amount'];
-const CREDIT_HEADERS = ['credit', 'deposit', 'deposit amt', 'credit amount'];
+const DATE_HEADERS = ['date', 'txn date', 'transaction date', 'value date', 'posting date'];
+const DESC_HEADERS = ['description', 'narration', 'particulars', 'details', 'remarks', 'transaction remarks'];
+const DEBIT_HEADERS = ['debit', 'withdrawal', 'withdrawal amt', 'debit amount', 'withdrawal amount'];
+const CREDIT_HEADERS = ['credit', 'deposit', 'deposit amt', 'credit amount', 'deposit amount'];
 const AMOUNT_HEADERS = ['amount', 'transaction amount'];
 const TYPE_HEADERS = ['type', 'transaction type', 'dr/cr'];
 
+// Bank exports commonly append a trailing "." (e.g. "Withdrawal Amt.") or extra
+// spaces to headers, so match on the header with trailing punctuation and
+// repeated whitespace stripped rather than requiring an exact string match.
+function normalizeHeader(h: string): string {
+  return h.trim().toLowerCase().replace(/\.+$/, '').replace(/\s+/g, ' ').trim();
+}
+
 function findColumn(headers: string[], candidates: string[]): number {
-  const normalized = headers.map((h) => h.trim().toLowerCase());
+  const normalized = headers.map(normalizeHeader);
   for (const candidate of candidates) {
     const idx = normalized.indexOf(candidate);
     if (idx !== -1) return idx;

@@ -117,6 +117,23 @@ const { rows, meta } = await res.json();
 
 This call **never writes to the database** — it's purely a preview. Show the user `rows` with checkboxes (per the product doc's review step), let them uncheck anything wrong, then POST the kept rows — each already carrying its `dedupeKey` — to §3's bulk endpoint to actually commit them.
 
+**Recognized column headers** (case-insensitive, trailing "." and extra spaces are ignored, so `"Withdrawal Amt."` and `"withdrawal amt"` both match):
+
+| Column | Accepted headers |
+|---|---|
+| Date (required) | `Date`, `Txn Date`, `Transaction Date`, `Value Date`, `Posting Date` |
+| Description | `Description`, `Narration`, `Particulars`, `Details`, `Remarks`, `Transaction Remarks` |
+| Debit (either this pair or Amount, required) | `Debit`, `Withdrawal`, `Withdrawal Amt`, `Debit Amount`, `Withdrawal Amount` |
+| Credit | `Credit`, `Deposit`, `Deposit Amt`, `Credit Amount`, `Deposit Amount` |
+| Amount (alternative to Debit/Credit pair) | `Amount`, `Transaction Amount` |
+| Type (used with Amount to tell debit from credit) | `Type`, `Transaction Type`, `Dr/Cr` |
+
+A file needs the Date column plus either (Debit and/or Credit) or (Amount, optionally with Type — rows default to debit if Type is absent or doesn't start with "cr"). Anything else returns `422`.
+
+**Date formats:** `DD/MM/YYYY` and `DD-MM-YYYY` (2 or 4 digit year) are parsed explicitly; anything else falls through to native `Date` parsing (so `YYYY-MM-DD` and most ISO-ish formats also work, but ambiguous formats like `MM/DD/YYYY` will be misread as `DD/MM/YYYY` — Indian bank exports are assumed).
+
+If your CSV uses a header not in this list, the row's column won't be detected — the fix is either to add the header variant server-side (tell us the exact text) or normalize headers client-side before upload.
+
 ---
 
 ## 6. Recurring expense templates — `/api/recurring`
