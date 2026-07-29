@@ -539,7 +539,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   type LimitKey = keyof typeof LIMITS.free;
 
+  // TEMP: subscription enforcement disabled for this phase — every checkLimit()
+  // call site (family members, reminders, bill scan, voice, WiseAI) short-circuits
+  // to "no limit hit" below. Flip back to false to restore enforcement exactly as
+  // it was; nothing else needs to change.
+  const SUBSCRIPTION_ENFORCEMENT_DISABLED = true;
+
   async function checkLimit(userId: string, limitKey: LimitKey, currentCount: number): Promise<{ error: string; limitKey: LimitKey; recommendedPlan: PlanId } | null> {
+    if (SUBSCRIPTION_ENFORCEMENT_DISABLED) return null;
     const user = await users.findOne({ _id: toId(userId) });
     if (!user) return null;
     const effectivePlan = getEffectivePlan(user);
