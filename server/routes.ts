@@ -481,10 +481,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       planInterval: user.planInterval || 'month',
       planStatus: user.planStatus || 'active',
       planRenewsAt: user.planRenewsAt || null,
+      planSource: user.planSource || null,
       trialStartedAt: user.trialStartedAt || null,
       trialUsed: !!user.trialUsed,
     };
   }
+
+  // Test grants are only ever available outside production, and only ever
+  // change bookkeeping (planSource, planRenewsAt) — never the entitlement
+  // resolution itself. getEffectivePlan/checkLimit read user.plan directly
+  // and never branch on planSource, so a granted plan yields identical
+  // limits/flags to a real purchase everywhere those are enforced.
+  const ALLOW_TEST_GRANTS = process.env.NODE_ENV !== 'production' && process.env.ALLOW_TEST_GRANTS !== 'false';
 
   const TRIAL_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -2029,11 +2037,47 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const renewsAt = new Date(interval === 'year' ? now + 365 * 24 * 60 * 60 * 1000 : now + 30 * 24 * 60 * 60 * 1000);
       await users.updateOne(
         { _id: toId(userId) },
-        { $set: { plan: plan.id, planInterval: interval, planStatus: 'active', planRenewsAt: renewsAt } },
+        { $set: { plan: plan.id, planInterval: interval, planStatus: 'active', planSource: 'store', planRenewsAt: renewsAt } },
       );
       return res.json({ ok: true, plan: plan.id, planInterval: interval, planRenewsAt: renewsAt });
     } catch (err) {
       console.error('Subscription purchase error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // Non-production only: instantly grants a plan with no payment, for QA before
+  // the store listing is live. Resolves through the exact same getEffectivePlan/
+  // checkLimit path as a real purchase, so it unlocks identical limits and flags.
+  // Distinguished from a real purchase only by planSource ("test" vs "store") and
+  // by never setting planRenewsAt — a test grant does not expire on its own and
+  // never counts toward revenue reporting.
+  app.post('/api/subscription/test-grant', authMiddleware, async (req, res) => {
+    if (!ALLOW_TEST_GRANTS) {
+      // 404, not 403 — do not reveal that this endpoint exists in production.
+      return res.status(404).json({ message: 'Not found' });
+    }
+    try {
+      const userId = (req as any).userId;
+      const { planId, interval } = req.body as { planId?: string; interval?: string };
+      const plan = planId ? getPlanById(planId) : undefined;
+      if (!plan) {
+        return res.status(400).json({ message: `planId must be one of: ${PLAN_ORDER.join(', ')}` });
+      }
+      if (interval !== 'month' && interval !== 'year') {
+        return res.status(400).json({ message: 'interval must be "month" or "year"' });
+      }
+      await users.updateOne(
+        { _id: toId(userId) },
+        {
+          $set: { plan: plan.id, planInterval: interval, planStatus: 'active', planSource: 'test' },
+          $unset: { planRenewsAt: '' },
+        },
+      );
+      console.log(`[TEST GRANT] userId=${userId} plan=${plan.id} interval=${interval}`);
+      return res.json({ ok: true, plan: plan.id, planInterval: interval, planSource: 'test' });
+    } catch (err) {
+      console.error('Subscription test-grant error:', err);
       return res.status(500).json({ message: 'Server error.' });
     }
   });
