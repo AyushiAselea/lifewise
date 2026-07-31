@@ -19,6 +19,7 @@ import { SystemSettingsSchema, type SystemSettings } from './db/system-settings-
 import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId } from '../constants/plans';
 import { parseBankCsv } from './csv-import';
 import { categorizeTransactionsWithAI } from './categorization-utils';
+import { projectFamilyReminders, notificationBody, type ProjectedFamilyReminder } from './family-reminders';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -1070,10 +1071,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // --- Family Hub Phase 5: generic array-backed sub-resources on family_members ---
   // Each feature stores its items as an array field on the family_members document,
   // matching the existing medicines/caregivers pattern above (not separate collections).
+
+  // A member is accessible to its owner or to any user listed in connectedCaregivers
+  // (see /api/family/shared-with-me) — caregivers get full read/write on these sub-resources.
+  async function findAccessibleFamilyMember(memberId: string, requesterId: string) {
+    const member = await family.findOne({ _id: toId(memberId) });
+    if (!member) return null;
+    const connected: any[] = Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : [];
+    const isOwner = member.userId === requesterId;
+    const isCaregiver = connected.some((c: any) => c.userId === requesterId);
+    if (!isOwner && !isCaregiver) return null;
+    return member;
+  }
+
   function registerFamilyArrayFeature(field: string) {
     app.get(`/api/family/:memberId/${field}`, authMiddleware, async (req, res) => {
       try {
-        const member = await family.findOne({ _id: toId(req.params.memberId), userId: (req as any).userId });
+        const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
         return res.json(Array.isArray((member as any)[field]) ? (member as any)[field] : []);
       } catch (err) {
@@ -1085,16 +1099,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
     app.post(`/api/family/:memberId/${field}`, authMiddleware, async (req, res) => {
       try {
         const memberId = req.params.memberId;
+        const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+        if (!member) return res.status(404).json({ message: 'Family member not found' });
         const item = {
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
           ...req.body,
           createdAt: new Date(),
         };
-        const result = await family.updateOne(
-          { _id: toId(memberId), userId: (req as any).userId },
+        await family.updateOne(
+          { _id: toId(memberId) },
           { $push: { [field]: item } } as any,
         );
-        if (result.matchedCount === 0) return res.status(404).json({ message: 'Family member not found' });
         return res.status(201).json(item);
       } catch (err) {
         console.error(`Post family ${field} error:`, err);
@@ -1105,7 +1120,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     app.patch(`/api/family/:memberId/${field}/:itemId`, authMiddleware, async (req, res) => {
       try {
         const { memberId, itemId } = req.params;
-        const member = await family.findOne({ _id: toId(memberId), userId: (req as any).userId });
+        const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
         const items = Array.isArray((member as any)[field]) ? (member as any)[field] : [];
         let updatedItem: any = null;
@@ -1116,7 +1131,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
         if (!updatedItem) return res.status(404).json({ message: 'Item not found' });
         await family.updateOne(
-          { _id: toId(memberId), userId: (req as any).userId },
+          { _id: toId(memberId) },
           { $set: { [field]: nextItems } } as any,
         );
         return res.json(updatedItem);
@@ -1129,11 +1144,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
     app.delete(`/api/family/:memberId/${field}/:itemId`, authMiddleware, async (req, res) => {
       try {
         const { memberId, itemId } = req.params;
-        const result = await family.updateOne(
-          { _id: toId(memberId), userId: (req as any).userId },
+        const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+        if (!member) return res.status(404).json({ message: 'Family member not found' });
+        await family.updateOne(
+          { _id: toId(memberId) },
           { $pull: { [field]: { id: itemId } } } as any,
         );
-        if (result.matchedCount === 0) return res.status(404).json({ message: 'Family member not found' });
         return res.json({ ok: true });
       } catch (err) {
         console.error(`Delete family ${field} error:`, err);
@@ -1157,13 +1173,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
     'customItems',        // Custom Feature
   ].forEach(registerFamilyArrayFeature);
 
+  // --- Family Hub Phase 2: projected reminders ---
+  // Read-only view derived from family records (owned + shared-as-caregiver).
+  // The family record is authoritative; this projection is never persisted.
+  app.get('/api/reminders/family', authMiddleware, async (req, res) => {
+    try {
+      const requesterId = (req as any).userId;
+      const members = await family
+        .find({ $or: [{ userId: requesterId }, { 'connectedCaregivers.userId': requesterId }] })
+        .toArray();
+      const reminders = projectFamilyReminders(members);
+      return res.json(reminders);
+    } catch (err) {
+      console.error('Get family reminders error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+  ['post', 'put', 'delete', 'patch'].forEach((method) => {
+    (app as any)[method]('/api/reminders/family', authMiddleware, (_req: any, res: any) => {
+      return res.status(405).json({ message: 'Family reminders are read-only; mutate the underlying family record instead.' });
+    });
+  });
+
   // Medication Stock: increment/decrement quantityRemaining without a full item replace
   app.patch('/api/family/:memberId/medicationStock/:itemId/adjust-stock', authMiddleware, async (req, res) => {
     try {
       const { memberId, itemId } = req.params;
       const delta = Number(req.body?.delta);
       if (!Number.isFinite(delta)) return res.status(400).json({ message: 'delta must be a number' });
-      const member = await family.findOne({ _id: toId(memberId), userId: (req as any).userId });
+      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       const items = Array.isArray((member as any).medicationStock) ? (member as any).medicationStock : [];
       let updatedItem: any = null;
@@ -1175,7 +1213,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
       if (!updatedItem) return res.status(404).json({ message: 'Item not found' });
       await family.updateOne(
-        { _id: toId(memberId), userId: (req as any).userId },
+        { _id: toId(memberId) },
         { $set: { medicationStock: nextItems } } as any,
       );
       return res.json(updatedItem);
@@ -1189,7 +1227,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // emergencySettings is a single object per member (not an array); emergencyLog is an array.
   app.get('/api/family/:memberId/emergency-settings', authMiddleware, async (req, res) => {
     try {
-      const member = await family.findOne({ _id: toId(req.params.memberId), userId: (req as any).userId });
+      const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       return res.json((member as any).emergencySettings || {});
     } catch (err) {
@@ -1201,11 +1239,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.put('/api/family/:memberId/emergency-settings', authMiddleware, async (req, res) => {
     try {
       const memberId = req.params.memberId;
-      const result = await family.updateOne(
-        { _id: toId(memberId), userId: (req as any).userId },
+      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+      if (!member) return res.status(404).json({ message: 'Family member not found' });
+      await family.updateOne(
+        { _id: toId(memberId) },
         { $set: { emergencySettings: req.body || {} } } as any,
       );
-      if (result.matchedCount === 0) return res.status(404).json({ message: 'Family member not found' });
       return res.json(req.body || {});
     } catch (err) {
       console.error('Put emergency settings error:', err);
@@ -1215,7 +1254,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.get('/api/family/:memberId/emergency-log', authMiddleware, async (req, res) => {
     try {
-      const member = await family.findOne({ _id: toId(req.params.memberId), userId: (req as any).userId });
+      const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       return res.json(Array.isArray((member as any).emergencyLog) ? (member as any).emergencyLog : []);
     } catch (err) {
@@ -1227,7 +1266,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.patch('/api/family/:memberId/emergency-log/:itemId', authMiddleware, async (req, res) => {
     try {
       const { memberId, itemId } = req.params;
-      const member = await family.findOne({ _id: toId(memberId), userId: (req as any).userId });
+      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       const items = Array.isArray((member as any).emergencyLog) ? (member as any).emergencyLog : [];
       let updatedItem: any = null;
@@ -1238,7 +1277,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
       if (!updatedItem) return res.status(404).json({ message: 'Item not found' });
       await family.updateOne(
-        { _id: toId(memberId), userId: (req as any).userId },
+        { _id: toId(memberId) },
         { $set: { emergencyLog: nextItems } } as any,
       );
       return res.json(updatedItem);
@@ -1251,7 +1290,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Custom Feature: customConfig is a single object per member, customItems already registered above.
   app.get('/api/family/:memberId/custom-config', authMiddleware, async (req, res) => {
     try {
-      const member = await family.findOne({ _id: toId(req.params.memberId), userId: (req as any).userId });
+      const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       return res.json((member as any).customConfig || {});
     } catch (err) {
@@ -1263,11 +1302,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.put('/api/family/:memberId/custom-config', authMiddleware, async (req, res) => {
     try {
       const memberId = req.params.memberId;
-      const result = await family.updateOne(
-        { _id: toId(memberId), userId: (req as any).userId },
+      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+      if (!member) return res.status(404).json({ message: 'Family member not found' });
+      await family.updateOne(
+        { _id: toId(memberId) },
         { $set: { customConfig: req.body || {} } } as any,
       );
-      if (result.matchedCount === 0) return res.status(404).json({ message: 'Family member not found' });
       return res.json(req.body || {});
     } catch (err) {
       console.error('Put custom config error:', err);
@@ -4450,6 +4490,111 @@ CRITICAL RULES:
               }
             } catch (medErr) {
               console.error('Med reminder error:', medErr);
+            }
+          }
+        }
+
+        // --- Family Hub Phase 3: projected reminder push notifications ---
+        // Fans out to owner + connected caregivers, same as medicine reminders above.
+        // Dedup key mirrors the bill scheduler: (userId, billId=natural key, channel, dayOffset).
+        for (const member of allFamily) {
+          let projected: ProjectedFamilyReminder[];
+          try {
+            projected = projectFamilyReminders([member]);
+          } catch (projErr) {
+            console.error('Family reminder projection error:', projErr);
+            continue;
+          }
+
+          for (const reminder of projected) {
+            try {
+              const due = new Date(reminder.dueDate);
+              if (Number.isNaN(due.getTime())) continue;
+
+              for (const daysBefore of reminder.reminderDaysBefore) {
+                const fireAt = new Date(due.getTime() - daysBefore * 24 * 60 * 60 * 1000);
+
+                // Skip lead times already in the past — a record added on/after its due
+                // date must not fire a burst of backdated alerts (spec §4.3).
+                if (fireAt.getTime() < now.getTime() - 60 * 1000) continue;
+
+                const withinWindow = fireAt.getTime() <= windowEnd.getTime();
+                if (!withinWindow) continue;
+
+                const recipientIds = getRecipientUserIds(member);
+                const recipientUsers = await users.find({ _id: { $in: recipientIds.map((id) => toId(id)) } }).toArray();
+                if (!recipientUsers.length) continue;
+
+                const title = reminder.name;
+                const body = notificationBody(title, daysBefore);
+
+                const freshRecipients: any[] = [];
+                for (const recipient of recipientUsers) {
+                  const already = await reminderLogs.findOne({
+                    userId: recipient._id.toString(),
+                    billId: reminder.id,
+                    channel: 'in_app',
+                    dayOffset: daysBefore,
+                  });
+                  if (already) continue;
+                  freshRecipients.push(recipient);
+                }
+                if (!freshRecipients.length) continue;
+
+                for (const recipient of freshRecipients) {
+                  await notifications.insertOne({
+                    userId: recipient._id.toString(),
+                    type: 'family-reminder',
+                    title,
+                    body,
+                    read: false,
+                    createdAt: new Date(),
+                    meta: {
+                      type: 'family-reminder',
+                      memberId: reminder.memberId,
+                      sourceKind: reminder.sourceKind,
+                      sourceId: reminder.sourceId,
+                    },
+                  });
+                }
+
+                const messaging = getFirebaseMessaging();
+                if (messaging) {
+                  try {
+                    const tokenDocs = await pushTokens
+                      .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
+                      .project({ token: 1 })
+                      .toArray();
+                    const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
+                    if (tokens.length) {
+                      await messaging.sendEachForMulticast({
+                        tokens,
+                        notification: { title, body },
+                        data: {
+                          type: 'family-reminder',
+                          memberId: reminder.memberId,
+                          sourceKind: reminder.sourceKind,
+                          sourceId: reminder.sourceId,
+                        },
+                      });
+                    }
+                  } catch (pushErr) {
+                    console.error('Family reminder FCM send error:', pushErr);
+                  }
+                }
+
+                for (const recipient of freshRecipients) {
+                  await reminderLogs.insertOne({
+                    userId: recipient._id.toString(),
+                    billId: reminder.id,
+                    channel: 'in_app',
+                    dayOffset: daysBefore,
+                    sentAt: new Date(),
+                  });
+                }
+              }
+            } catch (famReminderErr) {
+              console.error('Family reminder scheduler error:', famReminderErr);
             }
           }
         }
