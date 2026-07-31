@@ -1107,14 +1107,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     });
 
+    // Accepts an optional client-generated `id` in the body (see Family Hub
+    // Records — Server Persistence, §3.3): the client's id is the join key
+    // for reminder projections and must survive the device-to-server upload.
+    // Posting an id that already exists on this member upserts (merges) that
+    // item in place rather than creating a duplicate — required for the
+    // multi-device upload in §5 to converge instead of erroring.
     app.post(`/api/family/:memberId/${field}`, authMiddleware, async (req, res) => {
       try {
         const memberId = req.params.memberId;
         const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
+
+        const { id: bodyId, createdAt: _ignoredCreatedAt, ...rest } = req.body || {};
+        const clientId = bodyId != null ? String(bodyId) : null;
+        const items = Array.isArray((member as any)[field]) ? (member as any)[field] : [];
+        const existing = clientId ? items.find((it: any) => it.id === clientId) : null;
+
+        if (existing) {
+          const merged = { ...existing, ...rest, id: existing.id, createdAt: existing.createdAt };
+          const nextItems = items.map((it: any) => (it.id === existing.id ? merged : it));
+          await family.updateOne({ _id: toId(memberId) }, { $set: { [field]: nextItems } } as any);
+          return res.status(200).json(merged);
+        }
+
         const item = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
-          ...req.body,
+          id: clientId || `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+          ...rest,
           createdAt: new Date(),
         };
         await family.updateOne(
@@ -1128,19 +1147,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     });
 
+    // Merges the patch onto the existing item; `id`/`createdAt` in the body
+    // are ignored (immutable, per §3.2). If the body includes `updatedAt`,
+    // it is only applied when newer than the stored value (last-write-wins,
+    // §6) — a patch with no `updatedAt` is always applied, unconditionally,
+    // matching pre-sync client behavior where no clock is available to compare.
     app.patch(`/api/family/:memberId/${field}/:itemId`, authMiddleware, async (req, res) => {
       try {
         const { memberId, itemId } = req.params;
         const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
         const items = Array.isArray((member as any)[field]) ? (member as any)[field] : [];
-        let updatedItem: any = null;
-        const nextItems = items.map((it: any) => {
-          if (it.id !== itemId) return it;
-          updatedItem = { ...it, ...req.body, id: it.id, updatedAt: new Date() };
-          return updatedItem;
-        });
-        if (!updatedItem) return res.status(404).json({ message: 'Item not found' });
+        const current = items.find((it: any) => it.id === itemId);
+        if (!current) return res.status(404).json({ message: 'Item not found' });
+
+        const { id: _ignoredId, createdAt: _ignoredCreatedAt, updatedAt: incomingUpdatedAt, ...rest } = req.body || {};
+
+        if (incomingUpdatedAt !== undefined && current.updatedAt) {
+          const incoming = new Date(incomingUpdatedAt).getTime();
+          const stored = new Date(current.updatedAt).getTime();
+          if (!Number.isNaN(incoming) && !Number.isNaN(stored) && incoming < stored) {
+            return res.json(current); // stale patch: stored value already newer, no-op
+          }
+        }
+
+        const updatedItem = { ...current, ...rest, id: current.id, createdAt: current.createdAt, updatedAt: new Date() };
+        const nextItems = items.map((it: any) => (it.id === itemId ? updatedItem : it));
         await family.updateOne(
           { _id: toId(memberId) },
           { $set: { [field]: nextItems } } as any,
