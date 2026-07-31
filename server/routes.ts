@@ -19,7 +19,7 @@ import { SystemSettingsSchema, type SystemSettings } from './db/system-settings-
 import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId } from '../constants/plans';
 import { parseBankCsv } from './csv-import';
 import { categorizeTransactionsWithAI } from './categorization-utils';
-import { projectFamilyReminders, notificationBody, type ProjectedFamilyReminder } from './family-reminders';
+import { projectFamilyReminders, notificationBody, localDateKey, type ProjectedFamilyReminder } from './family-reminders';
 import {
   isSupportedPreferredCurrency,
   formatAmountForCurrency,
@@ -4624,12 +4624,23 @@ CRITICAL RULES:
 
                 const title = reminder.name;
                 const body = notificationBody(title, daysBefore);
+                const route = `/family-reminder/${reminder.id}`;
+
+                // Daily-repeating kinds (routines, check-ins) reuse the same reminder.id
+                // every day — their dueDate is always "next occurrence," not a fixed date.
+                // Without a calendar-day component, the very first fire would permanently
+                // dedupe every subsequent day's occurrence. One-off kinds don't need this:
+                // their dueDate never recurs, so (reminder.id, dayOffset) alone is unique
+                // per real-world event.
+                const dedupeBillId = reminder.repeatType === 'daily'
+                  ? `${reminder.id}:${localDateKey(fireAt)}`
+                  : reminder.id;
 
                 const freshRecipients: any[] = [];
                 for (const recipient of recipientUsers) {
                   const already = await reminderLogs.findOne({
                     userId: recipient._id.toString(),
-                    billId: reminder.id,
+                    billId: dedupeBillId,
                     channel: 'in_app',
                     dayOffset: daysBefore,
                   });
@@ -4641,16 +4652,19 @@ CRITICAL RULES:
                 for (const recipient of freshRecipients) {
                   await notifications.insertOne({
                     userId: recipient._id.toString(),
-                    type: 'family-reminder',
+                    type: 'reminder',
                     title,
                     body,
                     read: false,
                     createdAt: new Date(),
                     meta: {
-                      type: 'family-reminder',
+                      type: 'family',
+                      kind: reminder.sourceKind,
                       memberId: reminder.memberId,
-                      sourceKind: reminder.sourceKind,
                       sourceId: reminder.sourceId,
+                      referenceId: reminder.sourceId,
+                      route,
+                      redirectUrl: route,
                     },
                   });
                 }
@@ -4668,10 +4682,11 @@ CRITICAL RULES:
                         tokens,
                         notification: { title, body },
                         data: {
-                          type: 'family-reminder',
+                          type: 'family',
+                          kind: reminder.sourceKind,
                           memberId: reminder.memberId,
-                          sourceKind: reminder.sourceKind,
                           sourceId: reminder.sourceId,
+                          route,
                         },
                       });
                     }
@@ -4683,7 +4698,7 @@ CRITICAL RULES:
                 for (const recipient of freshRecipients) {
                   await reminderLogs.insertOne({
                     userId: recipient._id.toString(),
-                    billId: reminder.id,
+                    billId: dedupeBillId,
                     channel: 'in_app',
                     dayOffset: daysBefore,
                     sentAt: new Date(),

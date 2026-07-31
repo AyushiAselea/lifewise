@@ -215,3 +215,15 @@ export function notificationBody(title: string, daysBefore: number): string {
   if (daysBefore === 1) return `${title} in 1 day`;
   return `${title} in ${daysBefore} days`;
 }
+
+// Local (server-timezone) calendar-day key, deliberately NOT toISOString().slice(0,10) —
+// that's UTC and rolls over at 05:30 IST, silently shifting which day a late-evening
+// reminder is keyed under. Used only to dedupe daily-repeating reminders (routines,
+// check-ins) per calendar day; one-off reminders don't need a date in their key at all,
+// since their underlying due date doesn't recur.
+export function localDateKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
