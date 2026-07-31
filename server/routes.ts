@@ -20,6 +20,16 @@ import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId 
 import { parseBankCsv } from './csv-import';
 import { categorizeTransactionsWithAI } from './categorization-utils';
 import { projectFamilyReminders, notificationBody, type ProjectedFamilyReminder } from './family-reminders';
+import {
+  isSupportedPreferredCurrency,
+  formatAmountForCurrency,
+  CURRENCY_SYMBOLS,
+  fetchAndStoreRateForDate,
+  backfillRateRange,
+  startDailyExchangeRateJob,
+  getRateOnOrBefore,
+  type SupportedCurrency,
+} from './exchange-rates';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -195,7 +205,7 @@ function renderReminderEmailTemplate(params: {
   dueDateLabel: string;
   category: string;
   amount: number;
-  currency: string;
+  currencyCode: 'INR' | SupportedCurrency;
   status: string;
   reminderSchedule: string;
   appUrl: string;
@@ -210,8 +220,8 @@ function renderReminderEmailTemplate(params: {
     .replace(/{{BILL_NAME}}/g, params.billName)
     .replace(/{{DUE_DATE}}/g, params.dueDateLabel)
     .replace(/{{CATEGORY}}/g, params.category)
-    .replace(/{{CURRENCY}}/g, params.currency)
-    .replace(/{{AMOUNT}}/g, params.amount.toLocaleString('en-IN', { maximumFractionDigits: 2 }))
+    .replace(/{{CURRENCY}}/g, CURRENCY_SYMBOLS[params.currencyCode])
+    .replace(/{{AMOUNT}}/g, formatAmountForCurrency(params.amount, params.currencyCode))
     .replace(/{{STATUS}}/g, params.status)
     .replace(/{{REMINDER_SCHEDULE}}/g, params.reminderSchedule)
     .replace(/{{APP_URL}}/g, params.appUrl);
@@ -474,6 +484,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const caregiverInvites = db.collection('caregiver_invites') as any;
   const usage = db.collection('usage') as any;
   const recurringExpenses = db.collection('recurring_expenses') as any;
+  const exchangeRates = db.collection('exchange_rates') as any;
 
   // --- Subscription helpers ---
   function withSubscriptionFields(user: any) {
@@ -1925,6 +1936,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           phoneVerified: user.phoneVerified,
           avatarUrl: (user as any).avatarUrl || null,
           dateOfBirth: (user as any).dateOfBirth || null,
+          preferredCurrency: (user as any).preferredCurrency || 'INR',
           ...withSubscriptionFields(user),
         },
       });
@@ -1936,17 +1948,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put('/api/auth/me', authMiddleware, async (req, res) => {
     try {
-      const { name, phone, avatarUrl, email, dateOfBirth } = req.body as {
+      const { name, phone, avatarUrl, email, dateOfBirth, preferredCurrency } = req.body as {
         name?: string;
         phone?: string | null;
         avatarUrl?: string | null;
         email?: string;
         dateOfBirth?: string | null;
+        preferredCurrency?: string;
       };
       const update: any = {};
       if (name !== undefined) update.name = String(name).trim();
       if (phone !== undefined) update.phone = phone === null ? null : String(phone).trim();
       if (avatarUrl !== undefined) update.avatarUrl = avatarUrl === null ? null : String(avatarUrl);
+      if (preferredCurrency !== undefined) {
+        const code = String(preferredCurrency).toUpperCase().trim();
+        if (!isSupportedPreferredCurrency(code)) {
+          return res.status(400).json({ message: 'Unsupported currency. Must be one of INR, USD, EUR, GBP, JPY, AUD, CAD.' });
+        }
+        update.preferredCurrency = code;
+      }
       if (email !== undefined) {
         const emailNext = String(email).toLowerCase().trim();
         if (!emailNext) {
@@ -1985,11 +2005,42 @@ export async function registerRoutes(app: Express): Promise<Server> {
           phoneVerified: user.phoneVerified,
           avatarUrl: (user as any).avatarUrl,
           dateOfBirth: (user as any).dateOfBirth || null,
+          preferredCurrency: (user as any).preferredCurrency || 'INR',
           ...withSubscriptionFields(user),
         },
       });
     } catch (err) {
       console.error('Update me error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // --- Exchange rate history (INR base) ---
+  // A past day's rate is immutable once stored, so this is safe to cache hard client-side.
+  app.get('/api/exchange-rates/history', authMiddleware, async (req, res) => {
+    try {
+      const from = String(req.query.from || '');
+      const to = String(req.query.to || '');
+      const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRe.test(from) || !dateRe.test(to)) {
+        return res.status(400).json({ message: 'from and to are required as YYYY-MM-DD' });
+      }
+      if (from > to) {
+        return res.status(400).json({ message: 'from must not be after to' });
+      }
+
+      const docs = await exchangeRates
+        .find({ date: { $gte: from, $lte: to } })
+        .sort({ date: 1 })
+        .toArray();
+
+      const rates: Record<string, Record<string, number>> = {};
+      for (const doc of docs) {
+        rates[doc.date] = doc.rates;
+      }
+      return res.json({ base: 'INR', rates });
+    } catch (err) {
+      console.error('Exchange rate history error:', err);
       return res.status(500).json({ message: 'Server error.' });
     }
   });
@@ -4287,6 +4338,20 @@ CRITICAL RULES:
               if (already) continue;
 
               if (channel === 'email') {
+                // Amounts are stored in INR (see exchange-rates.ts); convert to the
+                // user's preferred currency for display only, using the latest known
+                // daily rate. Never rewrite the stored amount.
+                const userCurrency = isSupportedPreferredCurrency((user as any).preferredCurrency)
+                  ? (user as any).preferredCurrency
+                  : 'INR';
+                const rawAmount = bill.amount || 0;
+                let displayAmount = rawAmount;
+                if (userCurrency !== 'INR') {
+                  const latestRate = await getRateOnOrBefore(exchangeRates, new Date().toISOString().slice(0, 10));
+                  const rate = latestRate?.rates?.[userCurrency];
+                  if (typeof rate === 'number') displayAmount = rawAmount * rate;
+                }
+
                 const html = renderReminderEmailTemplate({
                   userName: user.name || user.email,
                   reminderType: bill.reminderType || 'bill',
@@ -4298,8 +4363,8 @@ CRITICAL RULES:
                     year: 'numeric',
                   }),
                   category: bill.category || 'bills',
-                  amount: bill.amount || 0,
-                  currency: '₹',
+                  amount: displayAmount,
+                  currencyCode: userCurrency as 'INR' | SupportedCurrency,
                   status: bill.status || 'active',
                   reminderSchedule: (Array.isArray(reminderDays) ? reminderDays : [])
                     .sort((a, b) => a - b)
@@ -4607,6 +4672,7 @@ CRITICAL RULES:
   }
 
   startReminderScheduler();
+  startDailyExchangeRateJob(exchangeRates);
 
   // ----- Emergency Alerts scheduler (missed-medicine notifications) -----
   // Notifies the owner and all accepted connected caregivers (see getRecipientUserIds).
