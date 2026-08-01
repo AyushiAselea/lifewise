@@ -30,6 +30,7 @@ import {
   getRateOnOrBefore,
   type SupportedCurrency,
 } from './exchange-rates';
+import { isExpoFormatToken, sendPushToUser, sendPushToTokenDocs } from './push';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -921,21 +922,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         const invitee = await users.findOne({ email: emailRaw });
         if (invitee) {
-          const messaging = getFirebaseMessaging();
-          if (messaging) {
-            const tokenDocs = await pushTokens.find({ userId: invitee._id.toString() }).project({ token: 1 }).toArray();
-            const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-            if (tokens.length) {
-              await messaging.sendEachForMulticast({
-                tokens,
-                notification: {
-                  title: 'Caregiver invite',
-                  body: `${inviteDoc.invitedByName || 'Someone'} wants to add you as a caregiver for ${member.name}.`,
-                },
-                data: { type: 'caregiver_invite', inviteId: result.insertedId.toString() },
-              });
-            }
-          }
+          await sendPushToUser(getFirebaseMessaging(), pushTokens, invitee._id.toString(), {
+            title: 'Caregiver invite',
+            body: `${inviteDoc.invitedByName || 'Someone'} wants to add you as a caregiver for ${member.name}.`,
+            channelId: 'default',
+            data: {
+              type: 'caregiver-invite',
+              inviteId: result.insertedId.toString(),
+              route: '/caregiver-invites',
+            },
+          });
         }
       } catch (pushErr) {
         console.error('Caregiver invite push error:', pushErr);
@@ -1021,21 +1017,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const owner = await users.findOne({ _id: toId(invite.invitedByUserId) });
         const acceptingUser = await users.findOne({ _id: toId(requesterId) });
         if (owner) {
-          const messaging = getFirebaseMessaging();
-          if (messaging) {
-            const tokenDocs = await pushTokens.find({ userId: owner._id.toString() }).project({ token: 1 }).toArray();
-            const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-            if (tokens.length) {
-              await messaging.sendEachForMulticast({
-                tokens,
-                notification: {
-                  title: 'Caregiver invite accepted',
-                  body: `${acceptingUser?.name || 'Someone'} accepted your caregiver invite for ${invite.memberName}.`,
-                },
-                data: { type: 'caregiver_invite_accepted', memberId: String(invite.memberId) },
-              });
-            }
-          }
+          await sendPushToUser(getFirebaseMessaging(), pushTokens, owner._id.toString(), {
+            title: 'Caregiver invite accepted',
+            body: `${acceptingUser?.name || 'Someone'} accepted your caregiver invite for ${invite.memberName}.`,
+            channelId: 'default',
+            data: {
+              type: 'caregiver-invite-accepted',
+              memberId: String(invite.memberId),
+              route: '/caregiver-invites',
+            },
+          });
         }
       } catch (pushErr) {
         console.error('Caregiver accept push error:', pushErr);
@@ -1929,9 +1920,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post('/api/push-token', authMiddleware, async (req, res) => {
     try {
-      const { token, platform } = req.body as { token?: string; platform?: 'ios' | 'android' | 'web' };
+      const { token, platform, tokenType } = req.body as { token?: string; platform?: 'ios' | 'android' | 'web'; tokenType?: string };
       if (!token) {
         return res.status(400).json({ message: 'token is required' });
+      }
+      // Expo push tokens are meaningful only to Expo's relay, not FCM — firebase-admin
+      // rejects every one of them. Refusing to store keeps push_tokens free of rows
+      // that can never succeed, rather than failing silently at send time.
+      if (isExpoFormatToken(token)) {
+        return res.status(400).json({ message: 'Expected a native FCM/APNs token, not an Expo push token.' });
       }
 
       await pushTokens.updateOne(
@@ -1941,6 +1938,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             userId: (req as any).userId,
             token,
             platform: platform || 'android',
+            tokenType: tokenType || 'fcm',
             updatedAt: new Date(),
           },
         },
@@ -4271,20 +4269,13 @@ CRITICAL RULES:
       try {
         const otherRecipientIds = getRecipientUserIds(updated).filter((id) => id !== requesterId);
         if (otherRecipientIds.length) {
-          const messaging = getFirebaseMessaging();
-          if (messaging) {
-            const tokenDocs = await pushTokens
-              .find({ userId: { $in: otherRecipientIds } })
-              .project({ token: 1 })
-              .toArray();
-            const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-            if (tokens.length) {
-              await messaging.sendEachForMulticast({
-                tokens,
-                data: { type: 'sync', memberId, medId },
-              });
-            }
-          }
+          const tokenDocs = await pushTokens
+            .find({ userId: { $in: otherRecipientIds } })
+            .project({ token: 1, userId: 1, _id: 0 })
+            .toArray();
+          await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
+            data: { type: 'sync', memberId, medId },
+          });
         }
       } catch (syncErr) {
         console.error('Medicine sync push error:', syncErr);
@@ -4441,41 +4432,20 @@ CRITICAL RULES:
                   meta,
                 });
 
-                const messaging = getFirebaseMessaging();
-                if (messaging) {
-                  try {
-                    const tokenDocs = await pushTokens
-                      .find({ userId: user._id?.toString?.() ?? user._id })
-                      .project({ token: 1, _id: 0 })
-                      .toArray();
-
-                    const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-
-                    if (tokens.length) {
-                        await messaging.sendEachForMulticast({
-                          tokens,
-                          notification: {
-                            title,
-                            body,
-                            imageUrl,
-                          },
-                          android: {
-                            notification: {
-                              imageUrl,
-                              priority: 'high',
-                            },
-                          },
-                          data: {
-                            type: 'reminder',
-                            billId: meta.billId,
-                            route: meta.route,
-                          },
-                        });
-                        console.log(`[Push] Multi-device send to ${tokens.length} tokens for user ${user.email}`);
-                    }
-                  } catch (err) {
-                    console.error('FCM send error:', err);
-                  }
+                try {
+                  await sendPushToUser(getFirebaseMessaging(), pushTokens, user._id?.toString?.() ?? user._id, {
+                    title,
+                    body,
+                    imageUrl,
+                    channelId: 'default',
+                    data: {
+                      type: 'reminder',
+                      billId: meta.billId,
+                      route: meta.route,
+                    },
+                  });
+                } catch (err) {
+                  console.error('FCM send error:', err);
                 }
               }
 
@@ -4559,20 +4529,19 @@ CRITICAL RULES:
                   });
                 }
 
-                const messaging = getFirebaseMessaging();
-                if (messaging) {
+                {
                   const tokenDocs = await pushTokens
                     .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
-                    .project({ token: 1 })
+                    .project({ token: 1, userId: 1, _id: 0 })
                     .toArray();
-                  const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-                  if (tokens.length) {
-                    await messaging.sendEachForMulticast({
-                      tokens,
-                      notification: { title, body },
-                      data: { type: 'medication', route }
-                    });
-                  }
+                  // memberId/medId are required, not just route — the client rebuilds
+                  // navigation state from these fields, not by parsing the route string.
+                  await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
+                    title,
+                    body,
+                    channelId: 'default',
+                    data: { type: 'medication', memberId: member._id.toString(), medId: med.id, route },
+                  });
                 }
 
                 for (const recipient of freshRecipients) {
@@ -4658,9 +4627,9 @@ CRITICAL RULES:
                     read: false,
                     createdAt: new Date(),
                     meta: {
-                      type: 'family',
-                      kind: reminder.sourceKind,
+                      type: 'family-reminder',
                       memberId: reminder.memberId,
+                      sourceKind: reminder.sourceKind,
                       sourceId: reminder.sourceId,
                       referenceId: reminder.sourceId,
                       route,
@@ -4669,30 +4638,27 @@ CRITICAL RULES:
                   });
                 }
 
-                const messaging = getFirebaseMessaging();
-                if (messaging) {
-                  try {
-                    const tokenDocs = await pushTokens
-                      .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
-                      .project({ token: 1 })
-                      .toArray();
-                    const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-                    if (tokens.length) {
-                      await messaging.sendEachForMulticast({
-                        tokens,
-                        notification: { title, body },
-                        data: {
-                          type: 'family',
-                          kind: reminder.sourceKind,
-                          memberId: reminder.memberId,
-                          sourceId: reminder.sourceId,
-                          route,
-                        },
-                      });
-                    }
-                  } catch (pushErr) {
-                    console.error('Family reminder FCM send error:', pushErr);
-                  }
+                try {
+                  const tokenDocs = await pushTokens
+                    .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
+                    .project({ token: 1, userId: 1, _id: 0 })
+                    .toArray();
+                  // memberId/sourceKind/sourceId are all required — the client rebuilds
+                  // the fam:<kind>:<memberId>:<sourceId> composite id from these, not the route string.
+                  await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
+                    title,
+                    body,
+                    channelId: 'default',
+                    data: {
+                      type: 'family-reminder',
+                      memberId: reminder.memberId,
+                      sourceKind: reminder.sourceKind,
+                      sourceId: reminder.sourceId,
+                      route,
+                    },
+                  });
+                } catch (pushErr) {
+                  console.error('Family reminder FCM send error:', pushErr);
                 }
 
                 for (const recipient of freshRecipients) {
@@ -4789,20 +4755,17 @@ CRITICAL RULES:
               } as any);
             }
 
-            const messaging = getFirebaseMessaging();
-            if (messaging) {
+            {
               const tokenDocs = await pushTokens
                 .find({ userId: { $in: recipientUsers.map((r: any) => r._id.toString()) } })
-                .project({ token: 1 })
+                .project({ token: 1, userId: 1, _id: 0 })
                 .toArray();
-              const tokens = tokenDocs.map((t: any) => t.token).filter(Boolean);
-              if (tokens.length) {
-                await messaging.sendEachForMulticast({
-                  tokens,
-                  notification: { title, body },
-                  data: { type: 'emergency', memberId: (member as any)._id.toString() },
-                });
-              }
+              await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
+                title,
+                body,
+                channelId: 'default',
+                data: { type: 'emergency', memberId: (member as any)._id.toString() },
+              });
             }
           } catch (memberErr) {
             console.error('Emergency alert per-member error:', memberErr);
