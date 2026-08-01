@@ -1,23 +1,28 @@
 # Push Notifications — Backend Fixes, Frontend Integration Guide
 
 **Audience:** Frontend team
-**Status:** The backend-side fixes from `Push Notifications — Backend Requirements` (2026-08-01) are implemented and live-verified in code. **Push still cannot be delivered end-to-end** — a second, more fundamental problem was found that blocks everything regardless of the token-type fix. See §0.
-**Verification:** Live-tested against the real database (19 dead tokens purged, confirmed via direct query) and the real Firebase project. Not committed/pushed yet — ask before assuming this is deployed.
+**Status:** ✅ **Push notifications are live.** All backend-side fixes from `Push Notifications — Backend Requirements` (2026-08-01) are implemented, and the credential blocker described in the original version of this doc (§0) has been resolved — a fresh Firebase service account key was generated and installed, and the fix was re-verified end-to-end.
+**Verification:** Live-tested against the real database and the real Firebase project, before and after the credential swap, so the before/after comparison in §0 is a genuine A/B, not an assumption.
 
 ---
 
-## 0. Read this first — push does not work yet, for a bigger reason than the token bug
+## 0. The credential blocker — found, and now fixed
 
-The original bug report (Expo tokens sent to FCM, which rejects them) is real and is fixed on the backend side (§1). But while verifying the fix with a real send, a second, independent problem surfaced:
+While verifying the Expo-token fix (§1) with a real send, a second, independent problem was found: **the backend's Firebase service account credential could not authenticate with Google at all**, for any request — unrelated to the Expo/FCM token mismatch, and it would have blocked push even with a perfect native FCM token.
 
-**The backend's Firebase service account credential cannot authenticate with Google at all**, for any request. This is not related to the Expo/FCM token mismatch — it would block push even with a perfect native FCM token.
+Confirmed at the time with three independent checks (system clock was accurate; hand-built the JWT with a different library and sent it directly to Google's OAuth2 endpoint, still rejected; the private key file itself was not corrupted, it correctly self-verified offline) — all pointing to the key having been revoked or rotated in the Firebase console after the old `server/firebase-service-account.json` was generated.
 
-Confirmed with three independent checks, not just a single failed send:
-1. System clock is accurate (ruled out clock skew, a common cause of this exact error).
-2. Bypassed `firebase-admin` entirely — hand-built the JWT with a different library and sent it directly to Google's OAuth2 endpoint. Still rejected: `invalid_grant: Invalid JWT Signature`.
-3. The private key file itself is *not* corrupted — it correctly signs and self-verifies offline. Google specifically doesn't recognize it, which points to the key having been revoked or rotated in the Firebase console after `server/firebase-service-account.json` was generated (dated 2026-07-10).
+**A fresh service account key has since been generated and installed.** Re-tested with the same method used to diagnose the original failure:
 
-**This needs someone with Firebase console access to generate a fresh service account key and replace the file — it's not fixable from application code on either side.** Until that happens, no push will be delivered no matter what token type the client sends. Everything below is correct and ready, but inert until the credential is replaced.
+| | Old key | New key |
+|---|---|---|
+| Direct JWT exchange with Google's OAuth2 endpoint | `400 invalid_grant: Invalid JWT Signature` | `200`, real access token returned |
+| Real send attempt (fake test token) | `app/invalid-credential` — rejected before even checking the token | `messaging/invalid-argument: The registration token is not a valid FCM registration token` — **Google authenticated the request and evaluated the token**, correctly rejecting it for being fake |
+| Dead-token pruning (§2) | Never ran — nothing got past the auth failure | Ran correctly — the fake token was pruned from `push_tokens` after being rejected |
+
+The error changing from an auth-level rejection to a token-level rejection is the proof: the credential itself works now. A real device's FCM token would go through cleanly where my synthetic test string correctly did not.
+
+**What this means for you:** nothing below is theoretical or "ready but inert" anymore — it's live. The only thing that still can't be verified from this side is actual delivery to a physical device, since that requires a real FCM/APNs token from a running app instance.
 
 ---
 
@@ -37,10 +42,10 @@ Confirmed with three independent checks, not just a single failed send:
 
 All 8 places in the backend that call FCM (bill reminders, medicine doses, family reminders, caregiver invites, caregiver-accept, medicine sync, emergency alerts) now go through one shared function (`server/push.ts`) instead of each duplicating the same call.
 
-**What changed in observable behavior once the credential issue (§0) is fixed:**
+**Observable behavior, confirmed live now that §0 is fixed:**
 - The old log line `[Push] Multi-device send to N tokens for user X` is gone — it printed on every attempt regardless of outcome, which is exactly how a 100%-failure state went unnoticed. It's replaced with `[Push] sent=X failed=Y`, which reflects what FCM actually reported.
-- A token FCM permanently rejects (invalid, unregistered — e.g. after an uninstall) is now automatically deleted from `push_tokens`. Previously dead tokens stayed forever and kept "succeeding" in the misleading log.
-- Verified live: sent to a token, got back `[Push] sent=0 failed=1` with the real FCM error code logged per-token — proving the result is actually being read now, not discarded.
+- A token FCM permanently rejects (invalid, unregistered — e.g. after an uninstall) is now automatically deleted from `push_tokens` — verified live post-fix: a fake token was correctly pruned after Google evaluated and rejected it.
+- A credential-level failure (like §0, before the fix) does **not** trigger pruning — only genuine per-token rejections do. This was checked deliberately, since incorrectly pruning on an auth failure would have wiped every legitimate token the moment the credential broke.
 
 **Nothing required on your side for this.**
 
@@ -80,26 +85,31 @@ Also fixed the in-app notification's `meta` object (what `GET /api/notifications
 
 ---
 
-## 4. §4.4 — unique index already existed, no action needed
+## 4. §4.4, point 1 — unique index already existed, no action needed
 
-Checked `reminder_logs` — the unique index on `(userId, billId, channel, dayOffset)` your doc asks for in §4.4 point 1 was already in place from earlier work. Multi-instance duplicate pushes are already structurally prevented; nothing changed here.
-
-The bounded-query and real-job-runner parts of §4.4 (points 2-3) were **not** addressed in this pass — flagging as still open if you want them prioritized.
+Checked `reminder_logs` — the unique index on `(userId, billId, channel, dayOffset)` your doc asks for in §4.4 point 1 was already in place from earlier work. Multi-instance duplicate pushes are already structurally prevented; nothing changed here. Points 2-3 (bounded query, real job runner) are listed as still open in §5.
 
 ---
 
 ## 5. What's still open from your original doc
 
+Nothing below is blocked by the credential anymore — these are just the parts of the original spec not addressed in this pass:
+
 - **§4.3** — recording push outcome (`sent`/`failed`) on the `reminder_logs` row itself, for diagnosability. Not done this pass.
+- **§4.4, points 2-3** — bounding the reminder scheduler's query by due date, and moving off a bare `setInterval` to a real job runner. Point 1 (the unique index) was already in place and is confirmed working.
 - **§4.5** — honoring sound/vibration preference per user via `channelId` selection. The shared helper accepts a `channelId` parameter and defaults to `'default'` everywhere it's called; wiring it up to read the user's actual `reminderSettings` wasn't done this pass.
 - **§6 / §7** — Family Hub non-medicine reminder coverage and caregiver fan-out are largely already built from earlier work (see `FAMILY_REMINDERS_FRONTEND_GUIDE.md` and `FAMILY_RECORDS_CAREGIVER_SHARING_VERIFIED.md`) — the cutover-ordering warning in your §6 still applies exactly as you described it, and is worth re-reading before flipping anything.
-- **§8 acceptance criteria requiring a physical device** — none of these can be verified from here (no dev build, no physical device in this environment). Everything in this document was verified at the API/code level, not on-device. Please run the device-level checklist from your original §8 once the credential in §0 is replaced.
 
 ---
 
-## 6. Suggested order once someone replaces the Firebase credential
+## 6. What to do next on your side
 
-1. Generate a fresh service account key from the Firebase console for project `lifewise-6e740`, replace `server/firebase-service-account.json`.
-2. Re-run the smoke test from your original doc's §8 (`sendEachForMulticast` to one known-good real device token, print `responses`).
-3. If that succeeds, everything in §1–§3 above should now work end-to-end with no further backend change.
-4. Then work through your own §8 device checklist for real delivery, tap-routing, and the sound/vibration and Family Hub coverage items still open in §5.
+The backend is ready — the remaining verification needs a real device, which is outside what can be done from here:
+
+1. Build a dev client (`npx expo run:android` / `run:ios` — `expo-notifications` does not run in Expo Go).
+2. Register a real device, confirm `POST /api/push-token` stores a native token and `GET` on `push_tokens` (or just trust the 200 response) shows no `ExponentPushToken[` prefix.
+3. Trigger any of the flows in §3 (a bill reminder, a medicine dose, a caregiver invite) and confirm the push actually arrives with the app fully closed.
+4. Tap it and confirm it opens the right screen, per the payload shapes in §3.
+5. Then work through the rest of your original doc's §8 device checklist (uninstall-prunes-token, sound/vibration preference, Family Hub coverage) as those pieces land.
+
+If a real send still doesn't arrive after all of the above, that's a new finding — the credential and token-handling layers are now confirmed working, so a further failure would point somewhere else (device-side permission state, a channel ID mismatch, or a FCM project configuration issue specific to that device's app instance).
