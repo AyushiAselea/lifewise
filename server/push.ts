@@ -114,6 +114,13 @@ async function sendPushToTokens(
           priority: 'high',
           notification: {
             channelId: payload.channelId,
+            // Must match android/app/src/main/res/drawable-*/notification_icon.png,
+            // which the app ships and declares in AndroidManifest.xml. Without an
+            // explicit icon here, FCM renders its own default in the system process
+            // when the app is backgrounded — a different logo than the one local,
+            // foreground-rendered notifications show for the same app.
+            icon: 'notification_icon',
+            color: '#4F46E5',
             ...(payload.imageUrl ? { imageUrl: payload.imageUrl } : {}),
           },
         };

@@ -79,6 +79,11 @@ async function initIndexes() {
     await (caregiverInvites as any).createIndex({ memberId: 1 });
     await (usage as any).createIndex({ userId: 1, yearMonth: 1 }, { unique: true });
     await (db.collection('recurring_expenses') as any).createIndex({ userId: 1 });
+    // The reminder scheduler queries reminder_logs once per bill/medicine/family
+    // reminder per channel on every tick; push_tokens is queried per-user on
+    // every send.
+    await (db.collection('reminder_logs') as any).createIndex({ userId: 1, billId: 1, channel: 1, dayOffset: 1 });
+    await (db.collection('push_tokens') as any).createIndex({ userId: 1 });
     console.log('[DB] Indexes initialized');
   } catch (err) {
     console.error('[DB] Index initialization failed:', err);
@@ -86,6 +91,20 @@ async function initIndexes() {
 }
 
 type CategoryType = 'health' | 'bills' | 'family' | 'work' | 'tasks' | 'subscriptions' | 'finance' | 'habits' | 'travel' | 'events' | 'food' | 'shopping' | 'transport' | 'entertainment' | 'education' | 'investment' | 'others';
+// The import client accepts a narrower set than CategoryType: 'work', 'tasks',
+// 'habits' and 'events' are not spend categories and would be silently coerced
+// to 'others' on the device. Normalise here so suggestedCategory is always a
+// value the client actually honours.
+const IMPORT_CATEGORIES = new Set<string>([
+  'food', 'transport', 'health', 'bills', 'shopping', 'entertainment',
+  'subscriptions', 'education', 'travel', 'investment', 'finance', 'family', 'others',
+]);
+
+function toImportCategory(raw: string | undefined): CategoryType {
+  const c = (raw || '').trim().toLowerCase();
+  return (IMPORT_CATEGORIES.has(c) ? c : 'others') as CategoryType;
+}
+
 type PaymentMode = 'upi' | 'cash' | 'card' | 'netbanking';
 const PAYMENT_MODES: PaymentMode[] = ['upi', 'cash', 'card', 'netbanking'];
 type ReminderType = 'bill' | 'subscription' | 'custom';
@@ -114,7 +133,9 @@ type ReminderChannel = 'email' | 'in_app';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-const statementUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+// 25MB: a 12-month PDF statement routinely exceeds 10MB. Buffered in memory,
+// so this is the ceiling on a single request's footprint.
+const statementUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
 const s3 = new S3Client({ region: AWS_REGION });
 const textract = new TextractClient({ region: AWS_REGION });
@@ -2491,8 +2512,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     authMiddleware,
     (req: any, res: any, next: any) => {
       statementUpload.single('file')(req, res, (err: any) => {
+        // 413 (not 400): the client has a specific "try a shorter date range"
+        // message for this status. Anything else reads as a generic failure.
         if (err?.code === 'LIMIT_FILE_SIZE') {
-          return res.status(400).json({ message: 'File must be 10MB or smaller.' });
+          return res.status(413).json({ message: 'That file is too large. Try exporting a shorter date range.' });
         }
         if (err) {
           console.error('Import preview multer error:', err);
@@ -2508,30 +2531,96 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return res.status(400).json({ message: 'file is required' });
         }
 
-        const isCsv = /\.csv$/i.test(file.originalname || '') || file.mimetype === 'text/csv';
-        if (!isCsv) {
-          return res.status(422).json({ message: 'Could not read this statement. Try the CSV export instead.' });
+        // Sniff the bytes, not the multipart content-type: Android's document
+        // picker reports files in Downloads as application/octet-stream, so
+        // gating on mimetype alone rejects valid statements.
+        const buf: Buffer = file.buffer;
+        const name: string = file.originalname || '';
+        const isPdf = buf.subarray(0, 5).toString('latin1') === '%PDF-' || /\.pdf$/i.test(name);
+        // xlsx is a zip ("PK"); xls is an OLE2 compound file.
+        const isXlsx = buf.subarray(0, 2).toString('latin1') === 'PK' && /\.xlsx?$/i.test(name);
+        const isXls = buf.subarray(0, 4).toString('hex') === 'd0cf11e0' || /\.xls$/i.test(name);
+
+        if (isPdf) {
+          return res.status(422).json({
+            message: "PDF statements aren't supported yet. Please use your bank's CSV export from net banking.",
+          });
+        }
+        if (isXlsx || isXls) {
+          return res.status(422).json({
+            message: "Excel statements aren't supported yet. Please use your bank's CSV export from net banking.",
+          });
         }
 
-        const text = file.buffer.toString('utf-8');
+        const isCsv = /\.csv$/i.test(name) || file.mimetype === 'text/csv';
+        if (!isCsv) {
+          return res.status(422).json({ message: 'Could not read this statement. Try the CSV export from your bank instead.' });
+        }
+
+        const text = buf.toString('utf-8');
         const { rows, rowsSkipped } = parseBankCsv(text);
 
+        // A structurally-fine file that simply held no transactions is a 200
+        // with an empty array ("No transactions found"), not an error. Only a
+        // file we could not make sense of at all is a 422.
+        if (rows.length === 0 && rowsSkipped === 0) {
+          return res.json({ rows: [], meta: { format: 'csv', rowsFound: 0, rowsSkipped: 0 } });
+        }
         if (rows.length === 0) {
-          return res.status(422).json({ message: 'Could not read this statement. Try the CSV export instead.' });
+          return res.status(422).json({ message: 'Could not read this statement. Try the CSV export from your bank instead.' });
         }
 
+        // Categorisation is best-effort: it must never hold the preview hostage.
+        // Batches of 50 run with bounded concurrency and an overall deadline —
+        // previously this was 10-at-a-time strictly sequentially, so a 3000-row
+        // statement meant 300 serial OpenAI round-trips (~10min) and the request
+        // effectively never returned. Rows past the cap, or any batch that fails
+        // or times out, simply fall back to 'others'.
         const openAIKey = getOpenAIKey();
-        const categories: string[] = [];
+        const categories: string[] = new Array(rows.length).fill('others');
+        // Batch stays at 10: larger prompts overrun the model's output limit and
+        // come back as truncated, unparseable JSON — a batch of 50 measured 249s
+        // and yielded nothing. 10 returns in ~2s.
+        const AI_ROW_CAP = 1000;
+        const AI_BATCH = 10;
+        const AI_CONCURRENCY = 4;
+        const AI_DEADLINE_MS = 25_000;
+        const AI_CALL_TIMEOUT_MS = 15_000;
+
         if (openAIKey) {
-          const batchSize = 10;
-          for (let i = 0; i < rows.length; i += batchSize) {
-            const batch = rows.slice(i, i + batchSize);
-            const batchCategories = await categorizeTransactionsWithAI(
-              batch.map((r) => ({ merchant: r.description, description: r.description })),
-              openAIKey,
-            );
-            categories.push(...batchCategories);
+          const batches: { start: number; items: typeof rows }[] = [];
+          for (let i = 0; i < Math.min(rows.length, AI_ROW_CAP); i += AI_BATCH) {
+            batches.push({ start: i, items: rows.slice(i, i + AI_BATCH) });
           }
+
+          const deadline = Date.now() + AI_DEADLINE_MS;
+          let cursor = 0;
+          const worker = async () => {
+            while (cursor < batches.length && Date.now() < deadline) {
+              const { start, items } = batches[cursor++];
+              try {
+                // The deadline above only gates between batches; race each call
+                // so one slow response cannot outlive it.
+                const out = await Promise.race([
+                  categorizeTransactionsWithAI(
+                    items.map((r) => ({ merchant: r.description, description: r.description })),
+                    openAIKey,
+                  ),
+                  new Promise<null>((resolve) => setTimeout(() => resolve(null), AI_CALL_TIMEOUT_MS)),
+                ]);
+                if (out) {
+                  out.forEach((c, j) => {
+                    if (c) categories[start + j] = c;
+                  });
+                }
+              } catch (err) {
+                console.error('Import preview categorization batch failed:', err);
+              }
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(AI_CONCURRENCY, batches.length) }, worker),
+          );
         }
 
         const dates = rows.map((r) => new Date(r.date).getTime());
@@ -2540,7 +2629,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           description: r.description,
           amount: r.amount,
           isDebit: r.isDebit,
-          suggestedCategory: categories[i] || 'others',
+          suggestedCategory: toImportCategory(categories[i]),
           dedupeKey: r.dedupeKey,
         }));
 
@@ -4306,6 +4395,12 @@ CRITICAL RULES:
   // ----- Reminder scheduler (email + in-app) -----
   const REMINDER_CHECK_INTERVAL_MS = 60_000;
   const REMINDER_WINDOW_MINUTES = 5;
+  // Advance reminders ("N days before") are day-based, not minute-based: they
+  // should land at a predictable hour on the right day, not only when the
+  // bill's exact due timestamp happens to fall inside the 5-minute scheduler
+  // window — which for a bill days away is never. Server local time; if
+  // per-user timezones are required this needs to move to a per-user check.
+  const REMINDER_SEND_HOUR = 9;
 
   function startReminderScheduler() {
     let running = false;
@@ -4338,13 +4433,24 @@ CRITICAL RULES:
 
             if (!reminderDays.includes(daysLeft)) continue;
 
-            const billTimeWithinWindow =
-              baseDate.getTime() >= now.getTime() - 60 * 1000 &&
-              baseDate.getTime() <= windowEnd.getTime();
-
-            if (!billTimeWithinWindow && daysLeft !== 0) {
-              continue;
+            let shouldSend: boolean;
+            if (daysLeft === 0) {
+              // Same-day: fire near the actual due time, as before.
+              shouldSend =
+                baseDate.getTime() >= now.getTime() - 60 * 1000 &&
+                baseDate.getTime() <= windowEnd.getTime();
+              // Catch up a same-day bill whose due time already passed while the
+              // server was down or busy. reminderLogs dedup below still enforces
+              // exactly one send per (bill, dayOffset).
+              if (!shouldSend && baseDate.getTime() < now.getTime()) shouldSend = true;
+            } else {
+              // Advance reminder: fire once at/after the send hour. ">=" (not
+              // "==") means a tick missed around a restart still catches up
+              // later the same day; dedup guarantees it only sends once.
+              shouldSend = now.getHours() >= REMINDER_SEND_HOUR;
             }
+
+            if (!shouldSend) continue;
 
             const user = await users.findOne({ _id: bill.userId ? toId(bill.userId) : toId('' + bill.userId) });
             if (!user || !user.email) continue;
@@ -4408,7 +4514,11 @@ CRITICAL RULES:
                     ? `Your ${bill.name || 'payment'} is due today.`
                     : `Your ${bill.name || 'payment'} is due in ${daysLeft} day${daysLeft === 1 ? '' : 's'}.`;
 
-                const imageUrl = bill.imageUrl || `https://api.dicebear.com/7.x/shapes/png?seed=${bill.category || 'bill'}&backgroundColor=4f46e5`;
+                // Only use an image the bill actually has — never fabricate one.
+                // This used to fall back to a dicebear.com abstract avatar, which
+                // isn't the app logo and made rendering depend on a third-party
+                // service being reachable.
+                const imageUrl: string | undefined = bill.imageUrl || undefined;
 
                 const meta = {
                   type: 'bill',
@@ -4482,10 +4592,13 @@ CRITICAL RULES:
                 const doseTime = new Date(now);
                 doseTime.setHours(hh, mm, 0, 0);
 
-                // Check if doseTime is within window
+                // Fire in the normal 5-minute window, or any time after if the
+                // dose was missed earlier today (e.g. a server restart at dose
+                // time) — logId is scoped to today's date, so dedup still caps
+                // this at one send per slot per day.
                 const withinWindow =
-                  doseTime.getTime() >= now.getTime() - 60 * 1000 &&
-                  doseTime.getTime() <= windowEnd.getTime();
+                  doseTime.getTime() <= windowEnd.getTime() &&
+                  (doseTime.getTime() >= now.getTime() - 60 * 1000 || doseTime.getTime() < now.getTime());
 
                 if (!withinWindow) continue;
 

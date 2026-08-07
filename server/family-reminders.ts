@@ -10,7 +10,9 @@ export type FamilySourceKind =
   | 'task'
   | 'routine'
   | 'checkin'
-  | 'travel';
+  | 'travel'
+  | 'insurance'
+  | 'custom';
 
 export interface ProjectedFamilyReminder {
   id: string;
@@ -40,6 +42,8 @@ const KIND_META: Record<FamilySourceKind, { category: string; icon: string; remi
   'routine': { category: 'habits', icon: 'time', reminderType: 'custom' },
   'checkin': { category: 'family', icon: 'call', reminderType: 'custom' },
   'travel': { category: 'travel', icon: 'airplane', reminderType: 'custom' },
+  'insurance': { category: 'family', icon: 'document-text', reminderType: 'custom' },
+  'custom': { category: 'family', icon: 'bookmark', reminderType: 'custom' },
 };
 
 const LEAD_TIMES: Record<FamilySourceKind, number[]> = {
@@ -51,6 +55,8 @@ const LEAD_TIMES: Record<FamilySourceKind, number[]> = {
   'routine': [0],
   'checkin': [0],
   'travel': [1, 0],
+  'insurance': [30, 7, 1],
+  'custom': [1, 0],
 };
 
 function buildId(sourceKind: FamilySourceKind, memberId: string, sourceId: string): string {
@@ -201,6 +207,23 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     const due = parseDate(trip.date);
     if (!due) continue;
     out.push(makeReminder('travel', memberId, memberName, String(trip.id), trip.title || trip.name || 'Travel', due));
+  }
+
+  // Insurance & Documents: reminderDate is optional per document (most documents,
+  // e.g. an ID scan, have none). Only documents that opted into a reminder project.
+  for (const doc of Array.isArray(member.documents) ? member.documents : []) {
+    if (!doc.reminderDate) continue;
+    const due = parseDate(doc.reminderDate);
+    if (!due) continue;
+    out.push(makeReminder('insurance', memberId, memberName, String(doc.id), doc.title || 'Renewal', due));
+  }
+
+  for (const item of Array.isArray(member.customItems) ? member.customItems : []) {
+    if (item.completed) continue;
+    if (!item.date) continue;
+    const due = parseDate(item.date);
+    if (!due) continue;
+    out.push(makeReminder('custom', memberId, memberName, String(item.id), item.title || item.name || 'Reminder', due));
   }
 
   return out;

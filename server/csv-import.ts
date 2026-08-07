@@ -82,17 +82,25 @@ function parseDate(raw: string): string | null {
   if (!raw) return null;
   const trimmed = raw.trim();
 
-  // DD/MM/YYYY or DD-MM-YYYY (the common Indian bank statement format)
+  // DD/MM/YYYY or DD-MM-YYYY (the common Indian bank statement format).
+  // Emit UTC midnight: the client renders with timeZone 'UTC', so building a
+  // local date here would shift 14 July into 13 July for any timezone east of
+  // Greenwich (IST included).
   const dmy = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
   if (dmy) {
     let [, d, m, y] = dmy;
     if (y.length === 2) y = `20${y}`;
-    const date = new Date(Number(y), Number(m) - 1, Number(d));
+    const date = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
     if (!Number.isNaN(date.getTime())) return date.toISOString();
   }
 
+  // Date-only ISO (YYYY-MM-DD) already parses as UTC midnight. Anything with a
+  // time component gets truncated to its UTC calendar day so the dedupeKey
+  // stays stable across formats that do and don't carry a time.
   const parsed = new Date(trimmed);
-  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate())).toISOString();
+  }
   return null;
 }
 
