@@ -129,6 +129,11 @@ const REMINDER_EMAIL_TEMPLATE = fs.existsSync(reminderTemplatePath)
   ? fs.readFileSync(reminderTemplatePath, 'utf-8')
   : '';
 
+const caregiverInviteTemplatePath = path.resolve(process.cwd(), 'server', 'templates', 'caregiver-invite-email.html');
+const CAREGIVER_INVITE_EMAIL_TEMPLATE = fs.existsSync(caregiverInviteTemplatePath)
+  ? fs.readFileSync(caregiverInviteTemplatePath, 'utf-8')
+  : '';
+
 type ReminderChannel = 'email' | 'in_app';
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -246,6 +251,22 @@ function renderReminderEmailTemplate(params: {
     .replace(/{{AMOUNT}}/g, formatAmountForCurrency(params.amount, params.currencyCode))
     .replace(/{{STATUS}}/g, params.status)
     .replace(/{{REMINDER_SCHEDULE}}/g, params.reminderSchedule)
+    .replace(/{{APP_URL}}/g, params.appUrl);
+}
+
+function renderCaregiverInviteEmailTemplate(params: {
+  inviterName: string;
+  inviterEmail: string;
+  memberName: string;
+  inviteeEmail: string;
+  appUrl: string;
+}): string {
+  if (!CAREGIVER_INVITE_EMAIL_TEMPLATE) return '';
+  return CAREGIVER_INVITE_EMAIL_TEMPLATE
+    .replace(/{{INVITER_NAME}}/g, params.inviterName || 'Someone')
+    .replace(/{{INVITER_EMAIL}}/g, params.inviterEmail || '')
+    .replace(/{{MEMBER_NAME}}/g, params.memberName || 'a family member')
+    .replace(/{{INVITEE_EMAIL}}/g, params.inviteeEmail || '')
     .replace(/{{APP_URL}}/g, params.appUrl);
 }
 
@@ -957,6 +978,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } catch (pushErr) {
         console.error('Caregiver invite push error:', pushErr);
       }
+
+      const inviteEmailHtml = renderCaregiverInviteEmailTemplate({
+        inviterName: inviteDoc.invitedByName,
+        inviterEmail: inviteDoc.invitedByEmail,
+        memberName: inviteDoc.memberName,
+        inviteeEmail: inviteDoc.inviteeEmail,
+        appUrl: APP_OPEN_URL,
+      });
+      sendReminderEmail({
+        to: inviteDoc.inviteeEmail,
+        subject: `${inviteDoc.invitedByName || 'Someone'} invited you to help care for ${inviteDoc.memberName} on LifeWise`,
+        html: inviteEmailHtml,
+      }).catch((e) => console.error('Caregiver invite email send error:', e));
 
       return res.status(201).json({ id: result.insertedId.toString(), ...inviteDoc });
     } catch (err) {
