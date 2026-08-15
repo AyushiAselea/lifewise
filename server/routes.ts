@@ -63,6 +63,7 @@ async function initIndexes() {
   const family = db.collection('family_members');
   const caregiverInvites = db.collection('caregiver_invites');
   const usage = db.collection('usage');
+  const subscriptionPayments = db.collection('subscription_payments');
 
   try {
     // Unique index for SMS deduplication: same user, same SMS unique ID
@@ -84,6 +85,11 @@ async function initIndexes() {
     // every send.
     await (db.collection('reminder_logs') as any).createIndex({ userId: 1, billId: 1, channel: 1, dayOffset: 1 });
     await (db.collection('push_tokens') as any).createIndex({ userId: 1 });
+    // RevenueCat retries webhooks on any non-2xx and after transient failures,
+    // so eventId must be unique — upsert on it, never blind-insert, or a
+    // user's payment history shows duplicated charges.
+    await (subscriptionPayments as any).createIndex({ eventId: 1 }, { unique: true });
+    await (subscriptionPayments as any).createIndex({ userId: 1, purchasedAt: -1 });
     console.log('[DB] Indexes initialized');
   } catch (err) {
     console.error('[DB] Index initialization failed:', err);
@@ -134,6 +140,7 @@ type ReminderStatus = 'active' | 'paid' | 'snoozed';
 const JWT_SECRET = process.env.JWT_SECRET || 'lifewise-secret-change-in-production';
 const JWT_EXPIRY = '7d';
 
+const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const REMINDER_EMAIL_FROM = process.env.REMINDER_EMAIL_FROM || 'LifeWise <no-reply@lifewise.app>';
 const APP_BASE_URL = process.env.APP_BASE_URL || 'https://lifewise.app';
@@ -548,6 +555,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   const usage = db.collection('usage') as any;
   const recurringExpenses = db.collection('recurring_expenses') as any;
   const exchangeRates = db.collection('exchange_rates') as any;
+  const subscriptionPayments = db.collection('subscription_payments') as any;
 
   // --- Subscription helpers ---
   function withSubscriptionFields(user: any) {
@@ -2287,6 +2295,133 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.json({ ok: true, plan: plan.id, planInterval: interval, planSource: 'test' });
     } catch (err) {
       console.error('Subscription test-grant error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // product_id -> { plan, interval } from the single source of truth in
+  // constants/plans.ts, instead of trusting RevenueCat's entitlement_ids
+  // naming to line up with our PlanId values.
+  const PRODUCT_ID_TO_PLAN = new Map<string, { plan: PlanId; interval: 'month' | 'year' }>();
+  for (const p of PLANS) {
+    if (p.productIdMonthly) PRODUCT_ID_TO_PLAN.set(p.productIdMonthly, { plan: p.id, interval: 'month' });
+    if (p.productIdYearly) PRODUCT_ID_TO_PLAN.set(p.productIdYearly, { plan: p.id, interval: 'year' });
+  }
+
+  const REVENUECAT_EVENT_TYPES = new Set([
+    'INITIAL_PURCHASE', 'RENEWAL', 'PRODUCT_CHANGE', 'CANCELLATION',
+    'UNCANCELLATION', 'EXPIRATION', 'BILLING_ISSUE', 'SUBSCRIPTION_PAUSED',
+    'TRANSFER', 'REFUND', 'REFUND_REVERSED',
+  ]);
+
+  // RevenueCat retries on any non-2xx and after transient failures, so this
+  // must be idempotent (upsert on eventId) and must not depend on our own
+  // user JWT — the caller is RevenueCat's server, not an app user.
+  app.post('/api/webhooks/revenuecat', async (req, res) => {
+    try {
+      if (!REVENUECAT_WEBHOOK_SECRET) {
+        console.error('[RevenueCat webhook] REVENUECAT_WEBHOOK_SECRET not configured, rejecting.');
+        return res.status(401).json({ message: 'Webhook not configured' });
+      }
+      const auth = req.headers.authorization || '';
+      const provided = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+      if (provided !== REVENUECAT_WEBHOOK_SECRET) {
+        return res.status(401).json({ message: 'Unauthorized' });
+      }
+
+      const event = (req.body && req.body.event) || req.body || {};
+      const eventId = event.id ? String(event.id) : null;
+      const eventType = String(event.type || '');
+      const userId = event.app_user_id ? String(event.app_user_id) : null;
+
+      // Ack anything we can't attribute so RevenueCat doesn't retry forever,
+      // but don't write a row we can't dedupe or scope to a user.
+      if (!eventId || !userId || !REVENUECAT_EVENT_TYPES.has(eventType)) {
+        return res.status(200).json({ ok: true, skipped: true });
+      }
+
+      const productId = event.product_id ? String(event.product_id) : null;
+      const mapped = productId ? PRODUCT_ID_TO_PLAN.get(productId) : undefined;
+
+      const doc = {
+        eventId,
+        userId,
+        type: eventType,
+        productId,
+        plan: mapped?.plan || null,
+        interval: mapped?.interval || null,
+        amount: typeof event.price === 'number' ? event.price : null,
+        currency: event.currency || null,
+        taxPercentage: typeof event.tax_percentage === 'number' ? event.tax_percentage : null,
+        store: event.store || null,
+        environment: event.environment || null,
+        purchasedAt: event.purchased_at_ms ? new Date(event.purchased_at_ms) : null,
+        expiresAt: event.expiration_at_ms ? new Date(event.expiration_at_ms) : null,
+        isRenewal: eventType === 'RENEWAL',
+        isRefunded: eventType === 'REFUND',
+        rawEvent: event,
+        createdAt: new Date(),
+      };
+
+      await subscriptionPayments.updateOne(
+        { eventId },
+        { $setOnInsert: doc },
+        { upsert: true },
+      );
+
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      console.error('RevenueCat webhook error:', err);
+      // Still 200: a 500 makes RevenueCat retry an event that may have
+      // already failed for a reason retrying won't fix (e.g. a malformed
+      // payload), and repeated retries are themselves noisy/costly. The
+      // eventId-unique index means a genuinely transient failure is safe
+      // to lose here — a real resend will just upsert again later.
+      return res.status(200).json({ ok: false });
+    }
+  });
+
+  app.get('/api/subscription/payments', authMiddleware, async (req, res) => {
+    try {
+      const userId = (req as any).userId;
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+      const before = req.query.before ? new Date(String(req.query.before)) : null;
+
+      const query: Record<string, any> = {
+        userId,
+        environment: { $ne: 'SANDBOX' },
+      };
+      if (before && !Number.isNaN(before.getTime())) {
+        query.purchasedAt = { $lt: before };
+      }
+
+      const rows = await subscriptionPayments
+        .find(query)
+        .sort({ purchasedAt: -1 })
+        .limit(limit + 1)
+        .toArray();
+
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+
+      return res.json({
+        payments: page.map((p: any) => ({
+          id: p._id.toString(),
+          type: p.type,
+          plan: p.plan,
+          productId: p.productId,
+          interval: p.interval,
+          amount: p.amount,
+          currency: p.currency,
+          store: p.store,
+          purchasedAt: p.purchasedAt,
+          expiresAt: p.expiresAt,
+          isRefunded: !!p.isRefunded,
+        })),
+        hasMore,
+      });
+    } catch (err) {
+      console.error('Get subscription payments error:', err);
       return res.status(500).json({ message: 'Server error.' });
     }
   });
