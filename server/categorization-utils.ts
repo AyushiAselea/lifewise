@@ -1,7 +1,7 @@
 import { getDb } from './db/mongodb';
 
 // Categories allowed in the system
-export type CategoryType = 'health' | 'bills' | 'family' | 'work' | 'tasks' | 'subscriptions' | 'finance' | 'habits' | 'travel' | 'events' | 'food' | 'shopping' | 'transport' | 'entertainment' | 'education' | 'investment' | 'others';
+export type CategoryType = 'health' | 'bills' | 'family' | 'work' | 'tasks' | 'subscriptions' | 'finance' | 'habits' | 'travel' | 'events' | 'food' | 'shopping' | 'transport' | 'entertainment' | 'education' | 'investment' | 'other_expense' | 'others';
 
 /**
  * Uses OpenAI gpt-4o-mini to categorize a batch of transactions.
@@ -13,14 +13,17 @@ export async function categorizeTransactionsWithAI(
 ): Promise<CategoryType[]> {
   if (!items.length) return [];
   
-  const prompt = `Categorize these Indian financial transactions: health, bills, family, work, tasks, subscriptions, finance, habits, travel, events, food, shopping, transport, entertainment, education, investment, others. 
+  const prompt = `Categorize these Indian financial transactions: health, bills, family, work, tasks, subscriptions, finance, habits, travel, events, food, shopping, transport, entertainment, education, investment, other_expense, others.
   Input items: ${JSON.stringify(items.map(i => `${i.merchant}: ${i.description}`))}.
-  Return ONLY a JSON array of strings in the EXACT same order as the input. 
+  Return ONLY a JSON array of strings in the EXACT same order as the input.
   Rules:
   - 'food' for Swiggy, Zomato, Restaurant, Cafe, Dining.
   - 'shopping' for Amazon, Flipkart, Myntra, Groceries, BigBasket, Zepto.
   - 'transport' for Uber, Ola, Rapido, Fuel, Petrol.
   - 'bills' for Utility, Electricity, Water, Gas, Rent.
+  - 'other_expense' for person-to-person UPI transfers, money sent to an
+    individual (not a business/merchant), self-transfers between the user's own
+    accounts, lending or repaying money to a person.
   - 'others' only if absolutely unclear.`;
 
   try {
@@ -68,9 +71,10 @@ export async function updateExistingOthers(userId: string, openAIKey: string): P
   const db = getDb();
   if (!db) return 0;
 
-  const others = await db.collection('transactions').find({ 
-    userId, 
-    category: 'others' 
+  const others = await db.collection('transactions').find({
+    userId,
+    category: 'others',
+    categoryLockedByUser: { $ne: true },
   }).toArray();
 
   if (others.length === 0) return 0;

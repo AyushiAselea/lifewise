@@ -90,7 +90,27 @@ async function initIndexes() {
   }
 }
 
-type CategoryType = 'health' | 'bills' | 'family' | 'work' | 'tasks' | 'subscriptions' | 'finance' | 'habits' | 'travel' | 'events' | 'food' | 'shopping' | 'transport' | 'entertainment' | 'education' | 'investment' | 'others';
+type CategoryType = 'health' | 'bills' | 'family' | 'work' | 'tasks' | 'subscriptions' | 'finance' | 'habits' | 'travel' | 'events' | 'food' | 'shopping' | 'transport' | 'entertainment' | 'education' | 'investment' | 'other_expense' | 'others';
+// Categories never eligible to be flagged as a money leak — either they're
+// already-intentional spend (investment/tax/rent/savings/bills/health/
+// education/finance) or, as of other_expense, explicitly user-marked as not
+// a leak (P2P transfers, self-transfers, repayments). Shared by GET /api/leaks,
+// the ghost-subscription rule, and the AI assistant's leaks snapshot so the
+// three surfaces can't drift out of sync with each other.
+const LEAK_EXEMPT_CATEGORIES = ['investment', 'tax', 'rent', 'savings', 'bills', 'health', 'education', 'finance', 'other_expense'];
+// Whitelist for transaction category writes. `category as CategoryType` is a
+// compile-time-only cast — without this check, any string a client sends is
+// persisted verbatim, and a typo'd category (e.g. "other-expense") silently
+// evades the LEAK_EXEMPT_CATEGORIES $nin filter and reappears as a leak.
+const VALID_CATEGORIES: CategoryType[] = [
+  'health', 'bills', 'family', 'work', 'tasks', 'subscriptions', 'finance',
+  'habits', 'travel', 'events', 'food', 'shopping', 'transport',
+  'entertainment', 'education', 'investment', 'other_expense', 'others',
+];
+function normalizeCategory(raw: unknown): CategoryType {
+  const lower = String(raw || '').trim().toLowerCase();
+  return (VALID_CATEGORIES as string[]).includes(lower) ? (lower as CategoryType) : 'others';
+}
 // The import client accepts a narrower set than CategoryType: 'work', 'tasks',
 // 'habits' and 'events' are not spend categories and would be silently coerced
 // to 'others' on the device. Normalise here so suggestedCategory is always a
@@ -1200,8 +1220,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
     // matching pre-sync client behavior where no clock is available to compare.
     app.patch(`/api/family/:memberId/${field}/:itemId`, authMiddleware, async (req, res) => {
       try {
+        const requesterId = (req as any).userId;
         const { memberId, itemId } = req.params;
-        const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+        const member = await findAccessibleFamilyMember(memberId, requesterId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
         const items = Array.isArray((member as any)[field]) ? (member as any)[field] : [];
         const current = items.find((it: any) => it.id === itemId);
@@ -1223,6 +1244,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           { _id: toId(memberId) },
           { $set: { [field]: nextItems } } as any,
         );
+        notifyOtherCaregivers(member, requesterId, { type: 'sync', memberId, field, itemId });
         return res.json(updatedItem);
       } catch (err) {
         console.error(`Patch family ${field} error:`, err);
@@ -1287,10 +1309,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Medication Stock: increment/decrement quantityRemaining without a full item replace
   app.patch('/api/family/:memberId/medicationStock/:itemId/adjust-stock', authMiddleware, async (req, res) => {
     try {
+      const requesterId = (req as any).userId;
       const { memberId, itemId } = req.params;
       const delta = Number(req.body?.delta);
       if (!Number.isFinite(delta)) return res.status(400).json({ message: 'delta must be a number' });
-      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+      const member = await findAccessibleFamilyMember(memberId, requesterId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       const items = Array.isArray((member as any).medicationStock) ? (member as any).medicationStock : [];
       let updatedItem: any = null;
@@ -1305,6 +1328,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         { _id: toId(memberId) },
         { $set: { medicationStock: nextItems } } as any,
       );
+      notifyOtherCaregivers(member, requesterId, { type: 'sync', memberId, field: 'medicationStock', itemId });
       return res.json(updatedItem);
     } catch (err) {
       console.error('Adjust medication stock error:', err);
@@ -1354,8 +1378,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.patch('/api/family/:memberId/emergency-log/:itemId', authMiddleware, async (req, res) => {
     try {
+      const requesterId = (req as any).userId;
       const { memberId, itemId } = req.params;
-      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+      const member = await findAccessibleFamilyMember(memberId, requesterId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
       const items = Array.isArray((member as any).emergencyLog) ? (member as any).emergencyLog : [];
       let updatedItem: any = null;
@@ -1369,6 +1394,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         { _id: toId(memberId) },
         { $set: { emergencyLog: nextItems } } as any,
       );
+      notifyOtherCaregivers(member, requesterId, { type: 'sync', memberId, field: 'emergencyLog', itemId });
       return res.json(updatedItem);
     } catch (err) {
       console.error('Patch emergency log error:', err);
@@ -2504,7 +2530,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         userId,
         merchant: String(merchant),
         amount: Number(amount),
-        category: (category as CategoryType) || 'others',
+        category: normalizeCategory(category),
         date: date ? new Date(date).toISOString() : new Date().toISOString(),
         upiId: upiId || '',
         isDebit: isDebit !== false,
@@ -2533,6 +2559,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
     } catch (err) {
       console.error('Post transaction error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
+  // Re-tag an existing transaction's category (e.g. mark an SMS-synced P2P
+  // transfer as other_expense after the fact — the app never shows a category
+  // picker during SMS sync, so this is the only way to correct one post-hoc).
+  // categoryLockedByUser makes the "never auto-overwrite a user's explicit
+  // choice" invariant explicit in the data, instead of relying on the AI
+  // re-categorizer's query happening to stay narrowly scoped to 'others'.
+  app.patch('/api/transactions/:id', authMiddleware, async (req, res) => {
+    try {
+      const userId = (req as any).userId;
+      const { category } = req.body;
+      if (category === undefined) {
+        return res.status(400).json({ message: 'category is required' });
+      }
+      const rawCategory = String(category || '').trim().toLowerCase();
+      if (!(VALID_CATEGORIES as string[]).includes(rawCategory)) {
+        return res.status(400).json({ message: 'Invalid category' });
+      }
+
+      const result = await transactions.findOneAndUpdate(
+        { _id: toId(req.params.id), userId },
+        { $set: { category: rawCategory as CategoryType, categoryLockedByUser: true, updatedAt: new Date() } },
+        { returnDocument: 'after' } as any,
+      );
+      const updated = (result as any)?.value ?? result;
+      if (!updated) return res.status(404).json({ message: 'Not found' });
+      return res.json({ id: updated._id.toString(), ...updated });
+    } catch (err) {
+      console.error('Patch transaction error:', err);
       return res.status(500).json({ message: 'Server error.' });
     }
   });
@@ -2717,7 +2775,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             userId,
             merchant: String(t.merchant),
             amount: Number(t.amount),
-            category: (t.category as CategoryType) || 'others',
+            category: normalizeCategory(t.category),
             date: t.date ? new Date(t.date).toISOString() : new Date().toISOString(),
             upiId: t.upiId || '',
             isDebit: t.isDebit !== false,
@@ -2789,7 +2847,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           amount,
           date,
           isDebit,
-          category: (t.category as CategoryType) || 'others',
+          category: normalizeCategory(t.category),
           upiId: t.upiId || '',
           description: t.description || String(t.message || ''),
           smsId,
@@ -3828,7 +3886,7 @@ JSON Output:`;
         transactions.find({
           userId,
           isDebit: true,
-          category: { $nin: ['investment', 'tax', 'rent', 'savings', 'bills', 'health', 'education', 'finance'] }
+          category: { $nin: LEAK_EXEMPT_CATEGORIES }
         }).sort({ date: -1 }).toArray(),
         bills.find({ userId }).toArray()
       ]);
@@ -3896,6 +3954,7 @@ JSON Output:`;
       // 2. "Ghost" or "Inactive" Subscriptions
       // If we have a bill reminder but no transaction in 45 days
       billList.forEach((bill: any) => {
+        if (LEAK_EXEMPT_CATEGORIES.includes(bill.category)) return;
         if (bill.reminderType === 'subscription' && bill.status !== 'cancelled') {
           const merchantLower = bill.name.toLowerCase();
           const txMatch = txList.find((t: any) => 
@@ -4003,7 +4062,11 @@ JSON Output:`;
       ]);
 
       const leakList = await transactions
-        .find({ userId: (req as any).userId, isDebit: true })
+        .find({
+          userId: (req as any).userId,
+          isDebit: true,
+          category: { $nin: LEAK_EXEMPT_CATEGORIES },
+        })
         .toArray();
 
       const merchantFreq: Record<string, { count: number; total: number; category: CategoryType }> = {};
@@ -4091,7 +4154,11 @@ JSON Output:`;
       ]);
 
       const leakList = await transactions
-        .find({ userId: (req as any).userId, isDebit: true })
+        .find({
+          userId: (req as any).userId,
+          isDebit: true,
+          category: { $nin: LEAK_EXEMPT_CATEGORIES },
+        })
         .toArray();
 
       const merchantFreq: Record<string, { count: number; total: number; category: CategoryType }> = {};
@@ -4424,6 +4491,26 @@ CRITICAL RULES:
       if (c?.userId) ids.add(String(c.userId));
     }
     return Array.from(ids);
+  }
+
+  // Silent data-only push to every connected caregiver except the one who
+  // just made the change, so a mark-done/status update by one caregiver
+  // shows up for everyone else without waiting on their own poll. Never
+  // throws — a push failure must not fail the mutation that triggered it.
+  function notifyOtherCaregivers(member: any, requesterId: string, data: Record<string, any>): void {
+    (async () => {
+      try {
+        const otherRecipientIds = getRecipientUserIds(member).filter((id) => id !== requesterId);
+        if (!otherRecipientIds.length) return;
+        const tokenDocs = await pushTokens
+          .find({ userId: { $in: otherRecipientIds } })
+          .project({ token: 1, userId: 1, _id: 0 })
+          .toArray();
+        await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, { data });
+      } catch (syncErr) {
+        console.error('Caregiver sync push error:', syncErr);
+      }
+    })();
   }
 
   // ----- Reminder scheduler (email + in-app) -----
