@@ -30,7 +30,7 @@ import {
   getRateOnOrBefore,
   type SupportedCurrency,
 } from './exchange-rates';
-import { isExpoFormatToken, sendPushToUser, sendPushToTokenDocs } from './push';
+import { isExpoFormatToken, sendPushToUser, sendPushToTokenDocs, REMINDER_ACTIONS_CATEGORY } from './push';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -4819,6 +4819,7 @@ CRITICAL RULES:
                     body,
                     imageUrl,
                     channelId: 'default',
+                    categoryId: REMINDER_ACTIONS_CATEGORY,
                     data: {
                       type: 'reminder',
                       billId: meta.billId,
@@ -4924,6 +4925,7 @@ CRITICAL RULES:
                     title,
                     body,
                     channelId: 'default',
+                    categoryId: REMINDER_ACTIONS_CATEGORY,
                     data: { type: 'medication', memberId: member._id.toString(), medId: med.id, route },
                   });
                 }
@@ -5033,6 +5035,7 @@ CRITICAL RULES:
                     title,
                     body,
                     channelId: 'default',
+                    categoryId: REMINDER_ACTIONS_CATEGORY,
                     data: {
                       type: 'family-reminder',
                       memberId: reminder.memberId,

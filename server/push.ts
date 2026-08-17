@@ -27,12 +27,26 @@ const PERMANENT_FAILURE_CODES = new Set([
   'messaging/invalid-argument',
 ]);
 
+// Registered client-side (lib/notifications.ts) with a Snooze-10-min and a
+// Done action. Pushes tagged with this category render both action buttons;
+// pushes without it show no buttons. Only reminder-type pushes should set
+// this — an invite or a silent sync push has no "done" concept.
+export const REMINDER_ACTIONS_CATEGORY = 'lifewise_reminder_actions';
+
+// Filename only, no path — the audio file ships inside the app binary and is
+// looked up by name on-device. A build that hasn't bundled it yet silently
+// falls back to the system default sound.
+const REMINDER_SOUND = 'reminder.wav';
+
 export interface PushPayload {
   title?: string;
   body?: string;
   data: Record<string, any>;
   imageUrl?: string;
   channelId?: string; // one of the four client-created Android channels; omit for a silent/data-only push
+  // Set to REMINDER_ACTIONS_CATEGORY to show Snooze/Done buttons and play the
+  // custom reminder sound; omit for informational pushes (invites, sync).
+  categoryId?: string;
 }
 
 export interface PushResult {
@@ -98,7 +112,9 @@ async function sendPushToTokens(
     try {
       const message: any = {
         tokens: chunk,
-        data: stringifyDataValues(payload.data),
+        data: stringifyDataValues(
+          payload.categoryId ? { ...payload.data, categoryId: payload.categoryId } : payload.data,
+        ),
       };
 
       if (payload.title || payload.body) {
@@ -122,9 +138,17 @@ async function sendPushToTokens(
             icon: 'notification_icon',
             color: '#4F46E5',
             ...(payload.imageUrl ? { imageUrl: payload.imageUrl } : {}),
+            ...(payload.categoryId ? { clickAction: payload.categoryId, sound: REMINDER_SOUND } : {}),
           },
         };
-        message.apns = { payload: { aps: { sound: 'default' } } };
+        message.apns = {
+          payload: {
+            aps: {
+              sound: payload.categoryId ? REMINDER_SOUND : 'default',
+              ...(payload.categoryId ? { category: payload.categoryId } : {}),
+            },
+          },
+        };
       } else {
         // Data-only/silent push: no notification block, no sound.
         message.android = { priority: 'high' };
