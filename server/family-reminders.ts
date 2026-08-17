@@ -18,6 +18,7 @@ export interface ProjectedFamilyReminder {
   id: string;
   memberId: string;
   memberName: string;
+  memberAvatarUrl: string | null;
   sourceKind: FamilySourceKind;
   sourceId: string;
   name: string;
@@ -31,6 +32,9 @@ export interface ProjectedFamilyReminder {
   isPaid: boolean;
   reminderDaysBefore: number[];
   source: 'family';
+  // Recurring kinds only (routine, checkin) — the actual schedule behind the
+  // derived "next occurrence" dueDate. 0=Sun..6=Sat; empty weekdays = every day.
+  recurrence?: { hour: number; minute: number; weekdays: number[] };
 }
 
 const KIND_META: Record<FamilySourceKind, { category: string; icon: string; reminderType: 'bill' | 'subscription' | 'custom' }> = {
@@ -73,9 +77,7 @@ function parseDate(value: any): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-// Routines/check-ins store a wall-clock "HH:MM AM/PM" with no date, since they
-// repeat daily. Resolve to the next occurrence: today if still ahead, else tomorrow.
-function resolveNextClockTime(clock: string, now: Date): Date | null {
+function parseClockTime(clock: string): { hour: number; minute: number } | null {
   const match = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(String(clock).trim());
   if (!match) return null;
   let hh = parseInt(match[1], 10);
@@ -84,29 +86,48 @@ function resolveNextClockTime(clock: string, now: Date): Date | null {
   if (ampm === 'PM' && hh < 12) hh += 12;
   if (ampm === 'AM' && hh === 12) hh = 0;
   if (hh > 23 || mm > 59) return null;
+  return { hour: hh, minute: mm };
+}
 
+// Routines/check-ins store a wall-clock "HH:MM AM/PM" with no date, since they
+// repeat daily. Resolve to the next occurrence: today if still ahead, else tomorrow.
+function resolveNextClockTime(clock: string, now: Date): Date | null {
+  const parsed = parseClockTime(clock);
+  if (!parsed) return null;
   const candidate = new Date(now);
-  candidate.setHours(hh, mm, 0, 0);
+  candidate.setHours(parsed.hour, parsed.minute, 0, 0);
   if (candidate.getTime() < now.getTime()) {
     candidate.setDate(candidate.getDate() + 1);
   }
   return candidate;
 }
 
+// Builds the recurrence schedule for a routine/checkin row. `days` is an
+// optional array of 0=Sun..6=Sat weekdays on the source record; missing or
+// empty means "every day", matching the client's own daily-fallback behavior.
+function buildRecurrence(clock: string, days: any): { hour: number; minute: number; weekdays: number[] } | undefined {
+  const parsed = parseClockTime(clock);
+  if (!parsed) return undefined;
+  const weekdays = Array.isArray(days) ? days.filter((d: any) => Number.isInteger(d) && d >= 0 && d <= 6) : [];
+  return { hour: parsed.hour, minute: parsed.minute, weekdays };
+}
+
 function makeReminder(
   sourceKind: FamilySourceKind,
   memberId: string,
   memberName: string,
+  memberAvatarUrl: string | null,
   sourceId: string,
   title: string,
   dueDate: Date,
-  overrides: Partial<Pick<ProjectedFamilyReminder, 'amount' | 'repeatType' | 'status' | 'isPaid'>> = {},
+  overrides: Partial<Pick<ProjectedFamilyReminder, 'amount' | 'repeatType' | 'status' | 'isPaid' | 'recurrence'>> = {},
 ): ProjectedFamilyReminder {
   const meta = KIND_META[sourceKind];
   return {
     id: buildId(sourceKind, memberId, sourceId),
     memberId,
     memberName,
+    memberAvatarUrl,
     sourceKind,
     sourceId,
     name: makeTitle(title, memberName),
@@ -120,6 +141,7 @@ function makeReminder(
     isPaid: overrides.isPaid ?? false,
     reminderDaysBefore: LEAD_TIMES[sourceKind],
     source: 'family',
+    ...(overrides.recurrence ? { recurrence: overrides.recurrence } : {}),
   };
 }
 
@@ -128,6 +150,7 @@ function makeReminder(
 export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
   const memberId = member._id?.toString?.() ?? String(member._id);
   const memberName = member.name || 'Family member';
+  const memberAvatarUrl: string | null = member.avatarUrl || null;
   const out: ProjectedFamilyReminder[] = [];
   const now = new Date();
 
@@ -135,7 +158,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (appt.completed) continue;
     const due = parseDate(appt.date);
     if (!due) continue;
-    out.push(makeReminder('appointment', memberId, memberName, String(appt.id), appt.doctorName || 'Appointment', due));
+    out.push(makeReminder('appointment', memberId, memberName, memberAvatarUrl, String(appt.id), appt.doctorName || 'Appointment', due));
   }
 
   for (const item of Array.isArray(member.medicationStock) ? member.medicationStock : []) {
@@ -148,14 +171,14 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     const refillDate = new Date(now);
     refillDate.setDate(refillDate.getDate() + Math.max(0, daysLeft));
     refillDate.setHours(9, 0, 0, 0);
-    out.push(makeReminder('medicine-stock', memberId, memberName, String(item.id), `Refill ${item.name || 'medicine'}`, refillDate));
+    out.push(makeReminder('medicine-stock', memberId, memberName, memberAvatarUrl, String(item.id), `Refill ${item.name || 'medicine'}`, refillDate));
   }
 
   for (const bill of Array.isArray(member.familyBills) ? member.familyBills : []) {
     if (bill.isPaid) continue;
     const due = parseDate(bill.dueDate);
     if (!due) continue;
-    out.push(makeReminder('family-bill', memberId, memberName, String(bill.id), bill.name || 'Bill', due, {
+    out.push(makeReminder('family-bill', memberId, memberName, memberAvatarUrl, String(bill.id), bill.name || 'Bill', due, {
       amount: Number(bill.amount) || 0,
       repeatType: 'monthly',
       isPaid: !!bill.isPaid,
@@ -166,7 +189,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (sub.cancelled || sub.isPaid) continue;
     const due = parseDate(sub.renewalDate);
     if (!due) continue;
-    out.push(makeReminder('subscription', memberId, memberName, String(sub.id), sub.name || 'Subscription', due, {
+    out.push(makeReminder('subscription', memberId, memberName, memberAvatarUrl, String(sub.id), sub.name || 'Subscription', due, {
       amount: Number(sub.amount) || 0,
       repeatType: sub.billingCycle === 'yearly' ? 'yearly' : 'monthly',
     }));
@@ -177,7 +200,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!task.dueDate) continue;
     const due = parseDate(task.dueDate);
     if (!due) continue;
-    out.push(makeReminder('task', memberId, memberName, String(task.id), task.title || task.name || 'Task', due));
+    out.push(makeReminder('task', memberId, memberName, memberAvatarUrl, String(task.id), task.title || task.name || 'Task', due));
   }
 
   for (const routine of Array.isArray(member.routines) ? member.routines : []) {
@@ -185,8 +208,9 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!routine.time) continue;
     const due = resolveNextClockTime(routine.time, now);
     if (!due) continue;
-    out.push(makeReminder('routine', memberId, memberName, String(routine.id), routine.title || routine.name || 'Routine', due, {
+    out.push(makeReminder('routine', memberId, memberName, memberAvatarUrl, String(routine.id), routine.title || routine.name || 'Routine', due, {
       repeatType: 'daily',
+      recurrence: buildRecurrence(routine.time, routine.days),
     }));
   }
 
@@ -195,10 +219,12 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!checkin.time) continue;
     // Note: server does not yet filter by checkin.days (weekday selection) — matches
     // the current frontend projection, which also treats every check-in as daily (spec §3.2).
+    // `recurrence.weekdays` still reports the raw `days` selection for the client to use.
     const due = resolveNextClockTime(checkin.time, now);
     if (!due) continue;
-    out.push(makeReminder('checkin', memberId, memberName, String(checkin.id), checkin.title || checkin.name || 'Check-in', due, {
+    out.push(makeReminder('checkin', memberId, memberName, memberAvatarUrl, String(checkin.id), checkin.title || checkin.name || 'Check-in', due, {
       repeatType: 'daily',
+      recurrence: buildRecurrence(checkin.time, checkin.days),
     }));
   }
 
@@ -206,7 +232,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (trip.completed) continue;
     const due = parseDate(trip.date);
     if (!due) continue;
-    out.push(makeReminder('travel', memberId, memberName, String(trip.id), trip.title || trip.name || 'Travel', due));
+    out.push(makeReminder('travel', memberId, memberName, memberAvatarUrl, String(trip.id), trip.title || trip.name || 'Travel', due));
   }
 
   // Insurance & Documents: reminderDate is optional per document (most documents,
@@ -215,7 +241,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!doc.reminderDate) continue;
     const due = parseDate(doc.reminderDate);
     if (!due) continue;
-    out.push(makeReminder('insurance', memberId, memberName, String(doc.id), doc.title || 'Renewal', due));
+    out.push(makeReminder('insurance', memberId, memberName, memberAvatarUrl, String(doc.id), doc.title || 'Renewal', due));
   }
 
   for (const item of Array.isArray(member.customItems) ? member.customItems : []) {
@@ -223,7 +249,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!item.date) continue;
     const due = parseDate(item.date);
     if (!due) continue;
-    out.push(makeReminder('custom', memberId, memberName, String(item.id), item.title || item.name || 'Reminder', due));
+    out.push(makeReminder('custom', memberId, memberName, memberAvatarUrl, String(item.id), item.title || item.name || 'Reminder', due));
   }
 
   return out;
