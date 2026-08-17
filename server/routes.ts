@@ -1290,6 +1290,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     'checkins',           // Call & Check-in
     'travelItems',        // Travel & Visits
     'customItems',        // Custom Feature
+    // --- Family Hub PRD compliance: previously-missing modules (2026-08) ---
+    // dietProfile / studyProfile / emergencyProfile are single-record-per-member
+    // kinds but use this same list-shaped CRUD: the client POSTs one record whose
+    // `id` equals the memberId and reads `[0]` from the GET. The upsert-by-id
+    // behavior in the POST handler above already makes repeat posts idempotent,
+    // so no special-casing is needed here.
+    'dietProfile',         // Diet & Meal Planning (PRD 12) — single record
+    'fitnessItems',        // Fitness Tracking (PRD 15)
+    'studyProfile',        // Study & Education (PRD 16) — single record
+    'moodLogs',            // Mental Health — mood log (PRD 17)
+    'wellnessReminders',   // Mental Health — reminders (PRD 17)
+    'vehicles',            // Vehicle Management (PRD 18)
+    'fuelLog',             // Vehicle Management — fuel entries (PRD 18)
+    'homeMaintenance',     // Home Maintenance (PRD 19)
+    'emergencyProfile',    // Emergency SOS medical profile (PRD 4) — single record
   ].forEach(registerFamilyArrayFeature);
 
   // --- Family Hub Phase 2: projected reminders ---
