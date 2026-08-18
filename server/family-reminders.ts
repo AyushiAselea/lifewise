@@ -35,6 +35,16 @@ export interface ProjectedFamilyReminder {
   // Recurring kinds only (routine, checkin) — the actual schedule behind the
   // derived "next occurrence" dueDate. 0=Sun..6=Sat; empty weekdays = every day.
   recurrence?: { hour: number; minute: number; weekdays: number[] };
+  // Lead offsets in MINUTES, for records with a sub-day reminder setting
+  // (appointment reminderLead, travel reminderHoursBefore). When present,
+  // REPLACES reminderDaysBefore for scheduling purposes (client spec §4.3).
+  leadMinutes?: number[];
+  // True when dueDate carries a real, user-chosen time of day (an appointment
+  // at 14:30). False when the underlying record is date-only and dueDate's
+  // time component is an artificial midnight/placeholder — the scheduler
+  // must move a day-based reminder for one of these to 09:00 local instead
+  // of firing at that placeholder time (client spec §4.2, the "00:00 bug").
+  hasExplicitTime: boolean;
 }
 
 const KIND_META: Record<FamilySourceKind, { category: string; icon: string; reminderType: 'bill' | 'subscription' | 'custom' }> = {
@@ -112,6 +122,37 @@ function buildRecurrence(clock: string, days: any): { hour: number; minute: numb
   return { hour: parsed.hour, minute: parsed.minute, weekdays };
 }
 
+const APPOINTMENT_LEAD_MINUTES: Record<string, number> = {
+  '1_day': 1440,
+  '3_hours': 180,
+  '1_hour': 60,
+  '30_min': 30,
+};
+
+// Client spec §4.3: appointment leadMinutes from reminderLead, default 1_day.
+function appointmentLeadMinutes(reminderLead: any): number[] {
+  const key = typeof reminderLead === 'string' ? reminderLead : '1_day';
+  return [APPOINTMENT_LEAD_MINUTES[key] ?? APPOINTMENT_LEAD_MINUTES['1_day']];
+}
+
+// Client spec §4.3: travel leadMinutes from reminderHoursBefore (hours), default 24h.
+function travelLeadMinutes(reminderHoursBefore: any): number[] {
+  const hours = Number(reminderHoursBefore);
+  const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 24;
+  return [safeHours * 60];
+}
+
+// Client spec §4.3: family-bill reminderDaysBefore from the record's own
+// reminderDaysBefore + dayOfReminderEnabled, deduped descending. Falls back
+// to the kind default ([3, 1, 0]) when the record has no explicit setting.
+function billReminderDaysBefore(reminderDaysBefore: any, dayOfReminderEnabled: any): number[] {
+  const chosen = Number(reminderDaysBefore);
+  if (!Number.isFinite(chosen) || chosen < 0) return LEAD_TIMES['family-bill'];
+  const days = new Set<number>([chosen]);
+  if (dayOfReminderEnabled) days.add(0);
+  return Array.from(days).sort((a, b) => b - a);
+}
+
 function makeReminder(
   sourceKind: FamilySourceKind,
   memberId: string,
@@ -120,7 +161,7 @@ function makeReminder(
   sourceId: string,
   title: string,
   dueDate: Date,
-  overrides: Partial<Pick<ProjectedFamilyReminder, 'amount' | 'repeatType' | 'status' | 'isPaid' | 'recurrence'>> = {},
+  overrides: Partial<Pick<ProjectedFamilyReminder, 'amount' | 'repeatType' | 'status' | 'isPaid' | 'recurrence' | 'leadMinutes' | 'reminderDaysBefore'>> & { hasExplicitTime: boolean },
 ): ProjectedFamilyReminder {
   const meta = KIND_META[sourceKind];
   return {
@@ -139,9 +180,11 @@ function makeReminder(
     repeatType: overrides.repeatType ?? 'none',
     status: overrides.status ?? 'active',
     isPaid: overrides.isPaid ?? false,
-    reminderDaysBefore: LEAD_TIMES[sourceKind],
+    reminderDaysBefore: overrides.reminderDaysBefore ?? LEAD_TIMES[sourceKind],
     source: 'family',
+    hasExplicitTime: overrides.hasExplicitTime,
     ...(overrides.recurrence ? { recurrence: overrides.recurrence } : {}),
+    ...(overrides.leadMinutes ? { leadMinutes: overrides.leadMinutes } : {}),
   };
 }
 
@@ -158,7 +201,10 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (appt.completed) continue;
     const due = parseDate(appt.date);
     if (!due) continue;
-    out.push(makeReminder('appointment', memberId, memberName, memberAvatarUrl, String(appt.id), appt.doctorName || 'Appointment', due));
+    out.push(makeReminder('appointment', memberId, memberName, memberAvatarUrl, String(appt.id), appt.doctorName || 'Appointment', due, {
+      hasExplicitTime: true,
+      leadMinutes: appointmentLeadMinutes(appt.reminderLead),
+    }));
   }
 
   for (const item of Array.isArray(member.medicationStock) ? member.medicationStock : []) {
@@ -171,7 +217,10 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     const refillDate = new Date(now);
     refillDate.setDate(refillDate.getDate() + Math.max(0, daysLeft));
     refillDate.setHours(9, 0, 0, 0);
-    out.push(makeReminder('medicine-stock', memberId, memberName, memberAvatarUrl, String(item.id), `Refill ${item.name || 'medicine'}`, refillDate));
+    // Already computed at a fixed 09:00 above — nothing for the scheduler to adjust.
+    out.push(makeReminder('medicine-stock', memberId, memberName, memberAvatarUrl, String(item.id), `Refill ${item.name || 'medicine'}`, refillDate, {
+      hasExplicitTime: true,
+    }));
   }
 
   for (const bill of Array.isArray(member.familyBills) ? member.familyBills : []) {
@@ -182,6 +231,8 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
       amount: Number(bill.amount) || 0,
       repeatType: 'monthly',
       isPaid: !!bill.isPaid,
+      hasExplicitTime: false,
+      reminderDaysBefore: billReminderDaysBefore(bill.reminderDaysBefore, bill.dayOfReminderEnabled),
     }));
   }
 
@@ -192,6 +243,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     out.push(makeReminder('subscription', memberId, memberName, memberAvatarUrl, String(sub.id), sub.name || 'Subscription', due, {
       amount: Number(sub.amount) || 0,
       repeatType: sub.billingCycle === 'yearly' ? 'yearly' : 'monthly',
+      hasExplicitTime: false,
     }));
   }
 
@@ -200,7 +252,9 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!task.dueDate) continue;
     const due = parseDate(task.dueDate);
     if (!due) continue;
-    out.push(makeReminder('task', memberId, memberName, memberAvatarUrl, String(task.id), task.title || task.name || 'Task', due));
+    out.push(makeReminder('task', memberId, memberName, memberAvatarUrl, String(task.id), task.title || task.name || 'Task', due, {
+      hasExplicitTime: false,
+    }));
   }
 
   for (const routine of Array.isArray(member.routines) ? member.routines : []) {
@@ -211,6 +265,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     out.push(makeReminder('routine', memberId, memberName, memberAvatarUrl, String(routine.id), routine.title || routine.name || 'Routine', due, {
       repeatType: 'daily',
       recurrence: buildRecurrence(routine.time, routine.days),
+      hasExplicitTime: true,
     }));
   }
 
@@ -225,6 +280,7 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     out.push(makeReminder('checkin', memberId, memberName, memberAvatarUrl, String(checkin.id), checkin.title || checkin.name || 'Check-in', due, {
       repeatType: 'daily',
       recurrence: buildRecurrence(checkin.time, checkin.days),
+      hasExplicitTime: true,
     }));
   }
 
@@ -232,7 +288,10 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (trip.completed) continue;
     const due = parseDate(trip.date);
     if (!due) continue;
-    out.push(makeReminder('travel', memberId, memberName, memberAvatarUrl, String(trip.id), trip.title || trip.name || 'Travel', due));
+    out.push(makeReminder('travel', memberId, memberName, memberAvatarUrl, String(trip.id), trip.title || trip.name || 'Travel', due, {
+      hasExplicitTime: true,
+      leadMinutes: travelLeadMinutes(trip.reminderHoursBefore),
+    }));
   }
 
   // Insurance & Documents: reminderDate is optional per document (most documents,
@@ -241,7 +300,9 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!doc.reminderDate) continue;
     const due = parseDate(doc.reminderDate);
     if (!due) continue;
-    out.push(makeReminder('insurance', memberId, memberName, memberAvatarUrl, String(doc.id), doc.title || 'Renewal', due));
+    out.push(makeReminder('insurance', memberId, memberName, memberAvatarUrl, String(doc.id), doc.title || 'Renewal', due, {
+      hasExplicitTime: false,
+    }));
   }
 
   for (const item of Array.isArray(member.customItems) ? member.customItems : []) {
@@ -249,7 +310,9 @@ export function projectMemberReminders(member: any): ProjectedFamilyReminder[] {
     if (!item.date) continue;
     const due = parseDate(item.date);
     if (!due) continue;
-    out.push(makeReminder('custom', memberId, memberName, memberAvatarUrl, String(item.id), item.title || item.name || 'Reminder', due));
+    out.push(makeReminder('custom', memberId, memberName, memberAvatarUrl, String(item.id), item.title || item.name || 'Reminder', due, {
+      hasExplicitTime: false,
+    }));
   }
 
   return out;
@@ -263,6 +326,20 @@ export function notificationBody(title: string, daysBefore: number): string {
   if (daysBefore === 0) return `${title} is due today`;
   if (daysBefore === 1) return `${title} in 1 day`;
   return `${title} in ${daysBefore} days`;
+}
+
+// Client spec §4.5: minute-based lead body, for rows scheduled off leadMinutes
+// rather than reminderDaysBefore ("in 30 minutes" / "in 3 hours" / "is tomorrow").
+export function notificationBodyMinutes(title: string, minutesBefore: number): string {
+  if (minutesBefore <= 0) return `${title} is due now`;
+  if (minutesBefore < 60) return `${title} in ${minutesBefore} minutes`;
+  if (minutesBefore < 1440) {
+    const hours = Math.round(minutesBefore / 60);
+    return `${title} in ${hours} hour${hours === 1 ? '' : 's'}`;
+  }
+  if (minutesBefore === 1440) return `${title} is tomorrow`;
+  const days = Math.round(minutesBefore / 1440);
+  return `${title} in ${days} days`;
 }
 
 // Local (server-timezone) calendar-day key, deliberately NOT toISOString().slice(0,10) —

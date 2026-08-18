@@ -19,7 +19,7 @@ import { SystemSettingsSchema, type SystemSettings } from './db/system-settings-
 import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId } from '../constants/plans';
 import { parseBankCsv } from './csv-import';
 import { categorizeTransactionsWithAI } from './categorization-utils';
-import { projectFamilyReminders, notificationBody, localDateKey, type ProjectedFamilyReminder } from './family-reminders';
+import { projectFamilyReminders, notificationBody, notificationBodyMinutes, localDateKey, type ProjectedFamilyReminder } from './family-reminders';
 import {
   isSupportedPreferredCurrency,
   formatAmountForCurrency,
@@ -5179,15 +5179,58 @@ CRITICAL RULES:
               const due = new Date(reminder.dueDate);
               if (Number.isNaN(due.getTime())) continue;
 
-              for (const daysBefore of reminder.reminderDaysBefore) {
-                const fireAt = new Date(due.getTime() - daysBefore * 24 * 60 * 60 * 1000);
+              // Client spec §4.4: recurring kinds (routine, checkin) fire at
+              // recurrence.hour:minute on each weekday in recurrence.weekdays
+              // (empty = every day) — never off dueDate, which is only a
+              // derived "next occurrence" for sorting/display. Everything
+              // else fires at day- or minute-based offsets before dueDate.
+              const fireSlots: { fireAt: Date; offsetLabel: number; offsetUnit: 'days' | 'minutes' }[] = [];
 
+              if (reminder.recurrence) {
+                const { hour, minute, weekdays } = reminder.recurrence;
+                const matchesToday = weekdays.length === 0 || weekdays.includes(now.getDay());
+                if (matchesToday) {
+                  const candidate = new Date(now);
+                  candidate.setHours(hour, minute, 0, 0);
+                  fireSlots.push({ fireAt: candidate, offsetLabel: 0, offsetUnit: 'minutes' });
+                }
+              } else if (reminder.leadMinutes && reminder.leadMinutes.length) {
+                // Client spec §4.3: sub-day lead time (appointment reminderLead,
+                // travel reminderHoursBefore) — replaces reminderDaysBefore.
+                for (const minutesBefore of reminder.leadMinutes) {
+                  fireSlots.push({
+                    fireAt: new Date(due.getTime() - minutesBefore * 60 * 1000),
+                    offsetLabel: minutesBefore,
+                    offsetUnit: 'minutes',
+                  });
+                }
+              } else {
+                for (const daysBefore of reminder.reminderDaysBefore) {
+                  let fireAt = new Date(due.getTime() - daysBefore * 24 * 60 * 60 * 1000);
+                  // Client spec §4.2: a day-based offset on a date-only record
+                  // (no real time of day) fires at 09:00 local, not midnight.
+                  // Records with a genuine time of day keep it.
+                  if (!reminder.hasExplicitTime) {
+                    fireAt = new Date(fireAt);
+                    fireAt.setHours(REMINDER_SEND_HOUR, 0, 0, 0);
+                  }
+                  fireSlots.push({ fireAt, offsetLabel: daysBefore, offsetUnit: 'days' });
+                }
+              }
+
+              for (const { fireAt, offsetLabel, offsetUnit } of fireSlots) {
                 // Skip lead times already in the past — a record added on/after its due
                 // date must not fire a burst of backdated alerts (spec §4.3).
                 if (fireAt.getTime() < now.getTime() - 60 * 1000) continue;
 
                 const withinWindow = fireAt.getTime() <= windowEnd.getTime();
                 if (!withinWindow) continue;
+
+                // reminderLogs.dayOffset is a plain number shared with the bill
+                // scheduler, which only ever uses non-negative day counts — encode
+                // a minute-based offset as a distinct negative number so it can
+                // never collide with a real day-based dedupe entry.
+                const dayOffset = offsetUnit === 'days' ? offsetLabel : -(offsetLabel + 1);
 
                 // §7: a caregiver must not be notified about a module they can't
                 // see — filter recipients by allowedModules before anything is
@@ -5201,15 +5244,18 @@ CRITICAL RULES:
                 if (!recipientUsers.length) continue;
 
                 const title = reminder.name;
-                const body = notificationBody(title, daysBefore);
+                const body = offsetUnit === 'days'
+                  ? notificationBody(title, offsetLabel)
+                  : notificationBodyMinutes(title, offsetLabel);
                 const route = `/family-reminder/${reminder.id}`;
 
-                // Daily-repeating kinds (routines, check-ins) reuse the same reminder.id
-                // every day — their dueDate is always "next occurrence," not a fixed date.
-                // Without a calendar-day component, the very first fire would permanently
-                // dedupe every subsequent day's occurrence. One-off kinds don't need this:
-                // their dueDate never recurs, so (reminder.id, dayOffset) alone is unique
-                // per real-world event.
+                // Daily/weekday-repeating kinds (routines, check-ins) reuse the same
+                // reminder.id every occurrence — their dueDate is always "next
+                // occurrence," not a fixed date. Without a calendar-day component,
+                // the very first fire would permanently dedupe every subsequent
+                // day's occurrence. One-off kinds don't need this: their dueDate
+                // never recurs, so (reminder.id, dayOffset) alone is unique per
+                // real-world event.
                 const dedupeBillId = reminder.repeatType === 'daily'
                   ? `${reminder.id}:${localDateKey(fireAt)}`
                   : reminder.id;
@@ -5220,7 +5266,7 @@ CRITICAL RULES:
                     userId: recipient._id.toString(),
                     billId: dedupeBillId,
                     channel: 'in_app',
-                    dayOffset: daysBefore,
+                    dayOffset,
                   });
                   if (already) continue;
                   freshRecipients.push(recipient);
@@ -5238,6 +5284,7 @@ CRITICAL RULES:
                     meta: {
                       type: 'family-reminder',
                       memberId: reminder.memberId,
+                      reminderId: reminder.id,
                       sourceKind: reminder.sourceKind,
                       sourceId: reminder.sourceId,
                       referenceId: reminder.sourceId,
@@ -5264,8 +5311,10 @@ CRITICAL RULES:
                       .find({ userId: { $in: recipients.map((r: any) => r._id.toString()) } })
                       .project({ token: 1, userId: 1, _id: 0 })
                       .toArray();
-                    // memberId/sourceKind/sourceId are all required — the client rebuilds
-                    // the fam:<kind>:<memberId>:<sourceId> composite id from these, not the route string.
+                    // memberId/reminderId/sourceKind/sourceId are all required per the
+                    // client's payload spec (§4.5) — reminderId is the same
+                    // fam:<kind>:<memberId>:<sourceId> composite as reminder.id, sent
+                    // explicitly so the client doesn't have to reconstruct it.
                     await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
                       title,
                       body,
@@ -5274,6 +5323,7 @@ CRITICAL RULES:
                       data: {
                         type: 'family-reminder',
                         memberId: reminder.memberId,
+                        reminderId: reminder.id,
                         sourceKind: reminder.sourceKind,
                         sourceId: reminder.sourceId,
                         route,
@@ -5292,7 +5342,7 @@ CRITICAL RULES:
                     userId: recipient._id.toString(),
                     billId: dedupeBillId,
                     channel: 'in_app',
-                    dayOffset: daysBefore,
+                    dayOffset,
                     sentAt: new Date(),
                   });
                 }
