@@ -34,6 +34,7 @@ import { isExpoFormatToken, sendPushToUser, sendPushToTokenDocs, REMINDER_ACTION
 import {
   normalizePermissions,
   parsePermissionsInput,
+  parsePermissionsUpdate,
   canAccessModule,
   hasAccessLevel,
   isMarkDoneOnlyPatch,
@@ -696,7 +697,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         bloodGroup: m.bloodGroup || null,
         phone: m.phone || null,
         modules: Array.isArray(m.modules) ? m.modules : [],
-        features: m.features || {},
+        // null when unset — {} is indistinguishable from "never configured"
+        // on the client (§8 of CAREGIVER-PERMISSIONS-THE-EXACT-MISSING-PIECE).
+        features: m.features ?? null,
         caregivers: Array.isArray(m.caregivers) ? m.caregivers : [],
         medicines: Array.isArray(m.medicines) ? m.medicines : [],
       }));
@@ -720,11 +723,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const connected: any[] = Array.isArray(m.connectedCaregivers) ? m.connectedCaregivers : [];
         const entry = connected.find((c: any) => c.userId === requesterId);
         const permissions = normalizePermissions(entry?.permissions);
-        const features = m.features || {};
+        const features = m.features ?? null;
         // §6.3: don't advertise modules this caregiver isn't allowed to open.
         // allowedModules === null means unrestricted, so features pass through
         // unchanged — this only narrows for an explicitly restricted caregiver.
-        const scopedFeatures = permissions.allowedModules === null
+        // null stays null either way — nothing to scope down from "never set".
+        const scopedFeatures = !features || permissions.allowedModules === null
           ? features
           : Object.fromEntries(
               Object.entries(features).filter(([key]) => canAccessModule(permissions, key as FamilyFeatureKey)),
@@ -762,7 +766,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         bloodGroup: m.bloodGroup || null,
         phone: m.phone || null,
         modules: Array.isArray(m.modules) ? m.modules : [],
-        features: m.features || {},
+        // null when unset — {} is indistinguishable from "never configured"
+        // on the client (§8 of CAREGIVER-PERMISSIONS-THE-EXACT-MISSING-PIECE).
+        features: m.features ?? null,
         caregivers: Array.isArray(m.caregivers) ? m.caregivers : [],
         medicines: Array.isArray(m.medicines) ? m.medicines : [],
       });
@@ -788,7 +794,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         bloodGroup: bloodGroup || null,
         phone: phone || null,
         modules: Array.isArray(modules) ? modules : [],
-        features: features || {},
+        // null when the client sends nothing, not {} — an empty object was
+        // indistinguishable from "never configured" on read (§8 of
+        // CAREGIVER-PERMISSIONS-THE-EXACT-MISSING-PIECE). Existing members
+        // created before this change still have {} stored; this only fixes
+        // new members going forward.
+        features: features ?? null,
         caregivers: [],
         medicines: [],
         createdAt: new Date(),
@@ -1109,7 +1120,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: 'Caregiver not found' });
       }
 
-      const parsed = parsePermissionsInput(req.body);
+      const parsed = parsePermissionsUpdate(req.body);
       if ('error' in parsed) {
         return res.status(400).json({ message: parsed.error });
       }
