@@ -31,6 +31,17 @@ import {
   type SupportedCurrency,
 } from './exchange-rates';
 import { isExpoFormatToken, sendPushToUser, sendPushToTokenDocs, REMINDER_ACTIONS_CATEGORY } from './push';
+import {
+  normalizePermissions,
+  parsePermissionsInput,
+  canAccessModule,
+  hasAccessLevel,
+  isMarkDoneOnlyPatch,
+  KIND_TO_MODULE,
+  SOURCE_KIND_TO_MODULE,
+  type FamilyFeatureKey,
+  type CaregiverPermissions,
+} from './family-permissions';
 
 function toId(id: any): any {
   if (id instanceof ObjectId) return id;
@@ -700,23 +711,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // swallowed as an :id param.
   app.get('/api/family/shared-with-me', authMiddleware, async (req, res) => {
     try {
+      const requesterId = (req as any).userId;
       const list = await family
-        .find({ 'connectedCaregivers.userId': (req as any).userId })
+        .find({ 'connectedCaregivers.userId': requesterId })
         .sort({ createdAt: -1 })
         .toArray();
-      const out = list.map((m: any) => ({
-        id: m._id.toString(),
-        name: m.name,
-        relationship: m.relationship || 'self',
-        avatarUrl: m.avatarUrl || null,
-        dateOfBirth: m.dateOfBirth || null,
-        bloodGroup: m.bloodGroup || null,
-        phone: m.phone || null,
-        modules: Array.isArray(m.modules) ? m.modules : [],
-        features: m.features || {},
-        caregivers: Array.isArray(m.caregivers) ? m.caregivers : [],
-        medicines: Array.isArray(m.medicines) ? m.medicines : [],
-      }));
+      const out = list.map((m: any) => {
+        const connected: any[] = Array.isArray(m.connectedCaregivers) ? m.connectedCaregivers : [];
+        const entry = connected.find((c: any) => c.userId === requesterId);
+        const permissions = normalizePermissions(entry?.permissions);
+        const features = m.features || {};
+        // §6.3: don't advertise modules this caregiver isn't allowed to open.
+        // allowedModules === null means unrestricted, so features pass through
+        // unchanged — this only narrows for an explicitly restricted caregiver.
+        const scopedFeatures = permissions.allowedModules === null
+          ? features
+          : Object.fromEntries(
+              Object.entries(features).filter(([key]) => canAccessModule(permissions, key as FamilyFeatureKey)),
+            );
+        return {
+          id: m._id.toString(),
+          name: m.name,
+          relationship: m.relationship || 'self',
+          avatarUrl: m.avatarUrl || null,
+          dateOfBirth: m.dateOfBirth || null,
+          bloodGroup: m.bloodGroup || null,
+          phone: m.phone || null,
+          modules: Array.isArray(m.modules) ? m.modules : [],
+          features: scopedFeatures,
+          caregivers: Array.isArray(m.caregivers) ? m.caregivers : [],
+          medicines: Array.isArray(m.medicines) ? m.medicines : [],
+        };
+      });
       return res.json(out);
     } catch (err) {
       return res.status(500).json({ message: 'Server error.' });
@@ -931,6 +957,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
             avatarUrl: u?.avatarUrl || null,
             role: 'caregiver',
             connectedAt: c.connectedAt || null,
+            // Absent/null on the stored entry ⇒ full access (§1); only send an
+            // explicit object when the owner has actually restricted this
+            // caregiver, so the client's own "absent → full" normalization
+            // still applies to every pre-existing connection.
+            ...(c.permissions ? { permissions: c.permissions } : {}),
           };
         }),
       ];
@@ -950,6 +981,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const emailRaw = (req.body?.email || '').toString().trim().toLowerCase();
       if (!emailRaw || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailRaw)) {
         return res.status(400).json({ message: 'A valid email is required' });
+      }
+
+      const parsedPermissions = parsePermissionsInput(req.body?.permissions);
+      if ('error' in parsedPermissions) {
+        return res.status(400).json({ message: parsedPermissions.error });
       }
 
       const requesterUser = await users.findOne({ _id: toId(requesterId) });
@@ -986,6 +1022,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         status: 'pending' as const,
         createdAt: new Date(),
         respondedAt: null,
+        // null = full access (§1/§4 of the permissions spec); only stored as an
+        // explicit object when the inviting owner chose to restrict up front.
+        permissions: parsedPermissions.value,
       };
       const result = await caregiverInvites.insertOne(inviteDoc);
 
@@ -1054,6 +1093,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Lets the owner change a connected caregiver's permissions after the fact —
+  // the common case, since owners usually discover they over-shared later.
+  // OWNER ONLY: a caregiver must never be able to widen their own access.
+  app.patch('/api/family/:memberId/connected-caregivers/:caregiverUserId/permissions', authMiddleware, async (req, res) => {
+    try {
+      const requesterId = (req as any).userId;
+      const { memberId, caregiverUserId } = req.params;
+      const member = await family.findOne({ _id: toId(memberId) });
+      if (!member) return res.status(404).json({ message: 'Not found' });
+      if (member.userId !== requesterId) return res.status(403).json({ message: 'Forbidden' });
+
+      const connected: any[] = Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : [];
+      if (!connected.some((c: any) => c.userId === caregiverUserId)) {
+        return res.status(404).json({ message: 'Caregiver not found' });
+      }
+
+      const parsed = parsePermissionsInput(req.body);
+      if ('error' in parsed) {
+        return res.status(400).json({ message: parsed.error });
+      }
+
+      await family.updateOne(
+        { _id: toId(memberId), 'connectedCaregivers.userId': caregiverUserId },
+        { $set: { 'connectedCaregivers.$.permissions': parsed.value } } as any,
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('Update caregiver permissions error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
   // --- Caregiver invite inbox ---
   app.get('/api/caregiver-invites', authMiddleware, async (req, res) => {
     try {
@@ -1088,7 +1159,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       await family.updateOne(
         { _id: toId(invite.memberId), 'connectedCaregivers.userId': { $ne: requesterId } },
-        { $push: { connectedCaregivers: { userId: requesterId, role: 'caregiver', connectedAt: new Date() } } } as any
+        {
+          $push: {
+            connectedCaregivers: {
+              userId: requesterId,
+              role: 'caregiver',
+              connectedAt: new Date(),
+              // Carries the permissions chosen at invite time (§2); null/absent
+              // means the invite didn't restrict anything, so this caregiver
+              // gets full access like every pre-existing connection.
+              permissions: invite.permissions || null,
+            },
+          },
+        } as any
       );
 
       await caregiverInvites.updateOne(
@@ -1169,11 +1252,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return member;
   }
 
+  // The owner is never restricted (§1). A caregiver's effective permissions
+  // come from their connectedCaregivers entry; absent/null there means full
+  // access, so every caregiver connected before this feature existed is
+  // unaffected. Returns null only if the requester has no relationship to
+  // this member at all (caller should treat that as not-found/forbidden).
+  function resolveRequesterPermissions(member: any, requesterId: string): CaregiverPermissions | null {
+    if (member.userId === requesterId) return { allowedModules: null, accessLevel: 'full' };
+    const connected: any[] = Array.isArray(member.connectedCaregivers) ? member.connectedCaregivers : [];
+    const entry = connected.find((c: any) => c.userId === requesterId);
+    if (!entry) return null;
+    return normalizePermissions(entry.permissions);
+  }
+
   function registerFamilyArrayFeature(field: string) {
+    const moduleKey = KIND_TO_MODULE[field];
+
     app.get(`/api/family/:memberId/${field}`, authMiddleware, async (req, res) => {
       try {
         const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
+        const permissions = resolveRequesterPermissions(member, (req as any).userId)!;
+        if (moduleKey && !canAccessModule(permissions, moduleKey)) {
+          return res.status(403).json({ message: 'Not permitted to access this module' });
+        }
         return res.json(Array.isArray((member as any)[field]) ? (member as any)[field] : []);
       } catch (err) {
         console.error(`Get family ${field} error:`, err);
@@ -1192,6 +1294,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const memberId = req.params.memberId;
         const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
+        const permissions = resolveRequesterPermissions(member, (req as any).userId)!;
+        if (moduleKey && !canAccessModule(permissions, moduleKey)) {
+          return res.status(403).json({ message: 'Not permitted to access this module' });
+        }
+        // A POST always creates-or-fully-replaces an item, so it always needs
+        // `full` — even the upsert-merge branch below can overwrite fields
+        // that aren't a completion/snooze toggle (§6.2).
+        if (!hasAccessLevel(permissions, 'full')) {
+          return res.status(403).json({ message: 'Not permitted to create or edit this item' });
+        }
 
         const { id: bodyId, createdAt: _ignoredCreatedAt, ...rest } = req.body || {};
         const clientId = bodyId != null ? String(bodyId) : null;
@@ -1232,6 +1344,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const { memberId, itemId } = req.params;
         const member = await findAccessibleFamilyMember(memberId, requesterId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
+        const permissions = resolveRequesterPermissions(member, requesterId)!;
+        if (moduleKey && !canAccessModule(permissions, moduleKey)) {
+          return res.status(403).json({ message: 'Not permitted to access this module' });
+        }
+        // A patch that only flips a completion/snooze field needs `mark_done`;
+        // any other field being edited needs `full` (§6.2).
+        const requiredLevel = isMarkDoneOnlyPatch(req.body || {}) ? 'mark_done' : 'full';
+        if (!hasAccessLevel(permissions, requiredLevel)) {
+          return res.status(403).json({ message: 'Not permitted to make this change' });
+        }
         const items = Array.isArray((member as any)[field]) ? (member as any)[field] : [];
         const current = items.find((it: any) => it.id === itemId);
         if (!current) return res.status(404).json({ message: 'Item not found' });
@@ -1263,8 +1385,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
     app.delete(`/api/family/:memberId/${field}/:itemId`, authMiddleware, async (req, res) => {
       try {
         const { memberId, itemId } = req.params;
-        const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+        const requesterId = (req as any).userId;
+        const member = await findAccessibleFamilyMember(memberId, requesterId);
         if (!member) return res.status(404).json({ message: 'Family member not found' });
+        const permissions = resolveRequesterPermissions(member, requesterId)!;
+        if (moduleKey && !canAccessModule(permissions, moduleKey)) {
+          return res.status(403).json({ message: 'Not permitted to access this module' });
+        }
+        if (!hasAccessLevel(permissions, 'full')) {
+          return res.status(403).json({ message: 'Not permitted to delete this item' });
+        }
         await family.updateOne(
           { _id: toId(memberId) },
           { $pull: { [field]: { id: itemId } } } as any,
@@ -1317,7 +1447,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .find({ $or: [{ userId: requesterId }, { 'connectedCaregivers.userId': requesterId }] })
         .toArray();
       const reminders = projectFamilyReminders(members);
-      return res.json(reminders);
+      // §7: a caregiver must not see reminders for a module they aren't
+      // allowed to open — same leak this whole spec exists to close, just via
+      // the reminders feed instead of the record routes directly.
+      const permissionsByMember = new Map<string, CaregiverPermissions>();
+      for (const member of members) {
+        const memberId = member._id?.toString?.() ?? String(member._id);
+        permissionsByMember.set(memberId, resolveRequesterPermissions(member, requesterId) || { allowedModules: [], accessLevel: 'view' });
+      }
+      const scoped = reminders.filter((r) => {
+        const permissions = permissionsByMember.get(r.memberId);
+        if (!permissions) return false;
+        const moduleKey = SOURCE_KIND_TO_MODULE[r.sourceKind];
+        return !moduleKey || canAccessModule(permissions, moduleKey);
+      });
+      return res.json(scoped);
     } catch (err) {
       console.error('Get family reminders error:', err);
       return res.status(500).json({ message: 'Server error.' });
@@ -1338,6 +1482,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!Number.isFinite(delta)) return res.status(400).json({ message: 'delta must be a number' });
       const member = await findAccessibleFamilyMember(memberId, requesterId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, requesterId)!;
+      if (!canAccessModule(permissions, 'stock')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
+      // Adjusting quantityRemaining isn't a completion/snooze toggle, so it
+      // needs `full` rather than `mark_done` (§6.2).
+      if (!hasAccessLevel(permissions, 'full')) {
+        return res.status(403).json({ message: 'Not permitted to make this change' });
+      }
       const items = Array.isArray((member as any).medicationStock) ? (member as any).medicationStock : [];
       let updatedItem: any = null;
       const nextItems = items.map((it: any) => {
@@ -1365,6 +1518,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, (req as any).userId)!;
+      if (!canAccessModule(permissions, 'emergency')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
       return res.json((member as any).emergencySettings || {});
     } catch (err) {
       console.error('Get emergency settings error:', err);
@@ -1375,8 +1532,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.put('/api/family/:memberId/emergency-settings', authMiddleware, async (req, res) => {
     try {
       const memberId = req.params.memberId;
-      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+      const requesterId = (req as any).userId;
+      const member = await findAccessibleFamilyMember(memberId, requesterId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, requesterId)!;
+      if (!canAccessModule(permissions, 'emergency')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
+      if (!hasAccessLevel(permissions, 'full')) {
+        return res.status(403).json({ message: 'Not permitted to make this change' });
+      }
       await family.updateOne(
         { _id: toId(memberId) },
         { $set: { emergencySettings: req.body || {} } } as any,
@@ -1392,6 +1557,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, (req as any).userId)!;
+      if (!canAccessModule(permissions, 'emergency')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
       return res.json(Array.isArray((member as any).emergencyLog) ? (member as any).emergencyLog : []);
     } catch (err) {
       console.error('Get emergency log error:', err);
@@ -1405,6 +1574,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { memberId, itemId } = req.params;
       const member = await findAccessibleFamilyMember(memberId, requesterId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, requesterId)!;
+      if (!canAccessModule(permissions, 'emergency')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
+      const requiredLevel = isMarkDoneOnlyPatch(req.body || {}) ? 'mark_done' : 'full';
+      if (!hasAccessLevel(permissions, requiredLevel)) {
+        return res.status(403).json({ message: 'Not permitted to make this change' });
+      }
       const items = Array.isArray((member as any).emergencyLog) ? (member as any).emergencyLog : [];
       let updatedItem: any = null;
       const nextItems = items.map((it: any) => {
@@ -1430,6 +1607,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const member = await findAccessibleFamilyMember(req.params.memberId, (req as any).userId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, (req as any).userId)!;
+      if (!canAccessModule(permissions, 'custom')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
       return res.json((member as any).customConfig || {});
     } catch (err) {
       console.error('Get custom config error:', err);
@@ -1440,8 +1621,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.put('/api/family/:memberId/custom-config', authMiddleware, async (req, res) => {
     try {
       const memberId = req.params.memberId;
-      const member = await findAccessibleFamilyMember(memberId, (req as any).userId);
+      const requesterId = (req as any).userId;
+      const member = await findAccessibleFamilyMember(memberId, requesterId);
       if (!member) return res.status(404).json({ message: 'Family member not found' });
+      const permissions = resolveRequesterPermissions(member, requesterId)!;
+      if (!canAccessModule(permissions, 'custom')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
+      if (!hasAccessLevel(permissions, 'full')) {
+        return res.status(403).json({ message: 'Not permitted to make this change' });
+      }
       await family.updateOne(
         { _id: toId(memberId) },
         { $set: { customConfig: req.body || {} } } as any,
@@ -4525,6 +4714,16 @@ CRITICAL RULES:
       if (!member) {
         return res.status(404).json({ message: 'Family member not found' });
       }
+      const permissions = resolveRequesterPermissions(member, requesterId)!;
+      if (!canAccessModule(permissions, 'medicines')) {
+        return res.status(403).json({ message: 'Not permitted to access this module' });
+      }
+      // taken/snooze/skip are all completion-flavored actions, so `mark_done`
+      // is always sufficient here (§6.2) — this route never edits the
+      // medicine's own fields (name, dosage, schedule, etc).
+      if (!hasAccessLevel(permissions, 'mark_done')) {
+        return res.status(403).json({ message: 'Not permitted to make this change' });
+      }
       const meds = Array.isArray(member.medicines) ? member.medicines : [];
       const now = new Date();
 
@@ -4874,7 +5073,11 @@ CRITICAL RULES:
 
                 if (!withinWindow) continue;
 
-                const recipientIds = getRecipientUserIds(member);
+                // §7: exclude any caregiver not permitted to see the medicines module.
+                const recipientIds = getRecipientUserIds(member).filter((id) => {
+                  const permissions = resolveRequesterPermissions(member, id);
+                  return !!permissions && canAccessModule(permissions, 'medicines');
+                });
                 const recipientUsers = await users.find({ _id: { $in: recipientIds.map((id) => toId(id)) } }).toArray();
                 if (!recipientUsers.length) continue;
 
@@ -4915,19 +5118,32 @@ CRITICAL RULES:
                 }
 
                 {
-                  const tokenDocs = await pushTokens
-                    .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
-                    .project({ token: 1, userId: 1, _id: 0 })
-                    .toArray();
-                  // memberId/medId are required, not just route — the client rebuilds
-                  // navigation state from these fields, not by parsing the route string.
-                  await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
-                    title,
-                    body,
-                    channelId: 'default',
-                    categoryId: REMINDER_ACTIONS_CATEGORY,
-                    data: { type: 'medication', memberId: member._id.toString(), medId: med.id, route },
-                  });
+                  // §7: view-level caregivers get the reminder but not the
+                  // Snooze/Done buttons (they can't act on either).
+                  const buttonEligible = freshRecipients.filter((r: any) =>
+                    hasAccessLevel(resolveRequesterPermissions(member, r._id.toString()) || { allowedModules: [], accessLevel: 'view' }, 'mark_done'),
+                  );
+                  const viewOnly = freshRecipients.filter((r: any) => !buttonEligible.includes(r));
+
+                  const sendGroup = async (recipients: any[], categoryId?: string) => {
+                    if (!recipients.length) return;
+                    const tokenDocs = await pushTokens
+                      .find({ userId: { $in: recipients.map((r: any) => r._id.toString()) } })
+                      .project({ token: 1, userId: 1, _id: 0 })
+                      .toArray();
+                    // memberId/medId are required, not just route — the client rebuilds
+                    // navigation state from these fields, not by parsing the route string.
+                    await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
+                      title,
+                      body,
+                      channelId: 'default',
+                      ...(categoryId ? { categoryId } : {}),
+                      data: { type: 'medication', memberId: member._id.toString(), medId: med.id, route },
+                    });
+                  };
+
+                  await sendGroup(buttonEligible, REMINDER_ACTIONS_CATEGORY);
+                  await sendGroup(viewOnly);
                 }
 
                 for (const recipient of freshRecipients) {
@@ -4973,7 +5189,14 @@ CRITICAL RULES:
                 const withinWindow = fireAt.getTime() <= windowEnd.getTime();
                 if (!withinWindow) continue;
 
-                const recipientIds = getRecipientUserIds(member);
+                // §7: a caregiver must not be notified about a module they can't
+                // see — filter recipients by allowedModules before anything is
+                // logged or pushed, not just at read time.
+                const reminderModuleKey = SOURCE_KIND_TO_MODULE[reminder.sourceKind];
+                const recipientIds = getRecipientUserIds(member).filter((id) => {
+                  const permissions = resolveRequesterPermissions(member, id);
+                  return !!permissions && (!reminderModuleKey || canAccessModule(permissions, reminderModuleKey));
+                });
                 const recipientUsers = await users.find({ _id: { $in: recipientIds.map((id) => toId(id)) } }).toArray();
                 if (!recipientUsers.length) continue;
 
@@ -5025,25 +5248,41 @@ CRITICAL RULES:
                 }
 
                 try {
-                  const tokenDocs = await pushTokens
-                    .find({ userId: { $in: freshRecipients.map((r: any) => r._id.toString()) } })
-                    .project({ token: 1, userId: 1, _id: 0 })
-                    .toArray();
-                  // memberId/sourceKind/sourceId are all required — the client rebuilds
-                  // the fam:<kind>:<memberId>:<sourceId> composite id from these, not the route string.
-                  await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
-                    title,
-                    body,
-                    channelId: 'default',
-                    categoryId: REMINDER_ACTIONS_CATEGORY,
-                    data: {
-                      type: 'family-reminder',
-                      memberId: reminder.memberId,
-                      sourceKind: reminder.sourceKind,
-                      sourceId: reminder.sourceId,
-                      route,
-                    },
-                  });
+                  // §7: a view-level caregiver gets the reminder push but not the
+                  // Snooze/Done buttons — those imply write access they don't have,
+                  // and the actions are rejected server-side regardless (see the
+                  // family-reminder Done/Snooze handler) but the buttons shouldn't
+                  // render as usable in the first place.
+                  const buttonEligible = freshRecipients.filter((r: any) =>
+                    hasAccessLevel(resolveRequesterPermissions(member, r._id.toString()) || { allowedModules: [], accessLevel: 'view' }, 'mark_done'),
+                  );
+                  const viewOnly = freshRecipients.filter((r: any) => !buttonEligible.includes(r));
+
+                  const sendGroup = async (recipients: any[], categoryId?: string) => {
+                    if (!recipients.length) return;
+                    const tokenDocs = await pushTokens
+                      .find({ userId: { $in: recipients.map((r: any) => r._id.toString()) } })
+                      .project({ token: 1, userId: 1, _id: 0 })
+                      .toArray();
+                    // memberId/sourceKind/sourceId are all required — the client rebuilds
+                    // the fam:<kind>:<memberId>:<sourceId> composite id from these, not the route string.
+                    await sendPushToTokenDocs(getFirebaseMessaging(), pushTokens, tokenDocs, {
+                      title,
+                      body,
+                      channelId: 'default',
+                      ...(categoryId ? { categoryId } : {}),
+                      data: {
+                        type: 'family-reminder',
+                        memberId: reminder.memberId,
+                        sourceKind: reminder.sourceKind,
+                        sourceId: reminder.sourceId,
+                        route,
+                      },
+                    });
+                  };
+
+                  await sendGroup(buttonEligible, REMINDER_ACTIONS_CATEGORY);
+                  await sendGroup(viewOnly);
                 } catch (pushErr) {
                   console.error('Family reminder FCM send error:', pushErr);
                 }
