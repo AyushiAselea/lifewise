@@ -22,6 +22,12 @@ export interface ProjectedFamilyReminder {
   sourceKind: FamilySourceKind;
   sourceId: string;
   name: string;
+  // The record's own title, before makeTitle() appends the member name.
+  // `name` stays "<title> · <memberName>" for GET /api/reminders/family
+  // consumers and for feeding notificationBody()/notificationBodyMinutes();
+  // this field exists so a push title can be composed in a different format
+  // (client spec: "Family Hub: <member> – <title>") without disturbing those.
+  recordTitle: string;
   amount: number;
   dueDate: string;
   category: string;
@@ -172,6 +178,7 @@ function makeReminder(
     sourceKind,
     sourceId,
     name: makeTitle(title, memberName),
+    recordTitle: title,
     amount: overrides.amount ?? 0,
     dueDate: dueDate.toISOString(),
     category: meta.category,
@@ -340,6 +347,24 @@ export function notificationBodyMinutes(title: string, minutesBefore: number): s
   if (minutesBefore === 1440) return `${title} is tomorrow`;
   const days = Math.round(minutesBefore / 1440);
   return `${title} in ${days} days`;
+}
+
+// Client spec §2: push notification title for the user's own reminder (bill,
+// personal task, etc) — "Reminder: <title>".
+export function personalReminderNotificationTitle(recordTitle: string): string {
+  return `Reminder: ${recordTitle}`;
+}
+
+// Client spec §2: push notification title for a Family Hub reminder —
+// "Family Hub: <member> – <title>". The separator is an EN DASH (U+2013),
+// not a hyphen, matching the client's spec exactly. familyName is accepted
+// for a future household-name feature (not built anywhere today — no
+// familyName/hubName/householdName field exists on family_members or users);
+// when present it replaces the member name as the hub identity, otherwise
+// the member's own name is used, per the client doc's fallback rule.
+export function familyReminderNotificationTitle(memberName: string, recordTitle: string, familyName?: string | null): string {
+  const hub = (familyName && familyName.trim()) || memberName;
+  return `Family Hub: ${hub} – ${recordTitle}`;
 }
 
 // Local (server-timezone) calendar-day key, deliberately NOT toISOString().slice(0,10) —

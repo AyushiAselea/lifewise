@@ -19,7 +19,7 @@ import { SystemSettingsSchema, type SystemSettings } from './db/system-settings-
 import { PLANS, LIMITS, FLAGS, PLAN_ORDER, nextPlanUp, getPlanById, type PlanId } from '../constants/plans';
 import { parseBankCsv } from './csv-import';
 import { categorizeTransactionsWithAI } from './categorization-utils';
-import { projectFamilyReminders, notificationBody, notificationBodyMinutes, localDateKey, type ProjectedFamilyReminder } from './family-reminders';
+import { projectFamilyReminders, notificationBody, notificationBodyMinutes, localDateKey, personalReminderNotificationTitle, familyReminderNotificationTitle, type ProjectedFamilyReminder } from './family-reminders';
 import {
   isSupportedPreferredCurrency,
   formatAmountForCurrency,
@@ -5088,8 +5088,12 @@ CRITICAL RULES:
                 });
 
                 try {
+                  // Client spec §2: the push notification's own title gets the
+                  // "Reminder: " prefix; the in-app notifications-list title above
+                  // stays as the bare bill name (that list is already under a
+                  // "Reminders" heading, so re-prefixing there would be redundant).
                   await sendPushToUser(getFirebaseMessaging(), pushTokens, user._id?.toString?.() ?? user._id, {
-                    title,
+                    title: personalReminderNotificationTitle(title),
                     body,
                     imageUrl,
                     channelId: 'default',
@@ -5157,7 +5161,8 @@ CRITICAL RULES:
                 if (!recipientUsers.length) continue;
 
                 const logId = `med-${member._id}-${med.id}-${slotKey}-${doseTime.toISOString().slice(0, 10)}`;
-                const title = `Time for ${member.name}'s medicine`;
+                // Client spec §2: Family Hub reminder title format.
+                const title = familyReminderNotificationTitle(member.name, med.name);
                 const body = `Take ${med.name} (${med.dosage || '1 dose'}) - ${slotKey.charAt(0).toUpperCase() + slotKey.slice(1)}`;
                 const route = `/medicine-details/${member._id.toString()}/${med.id}`;
 
@@ -5318,10 +5323,17 @@ CRITICAL RULES:
                 const recipientUsers = await users.find({ _id: { $in: recipientIds.map((id) => toId(id)) } }).toArray();
                 if (!recipientUsers.length) continue;
 
-                const title = reminder.name;
+                // Client spec §2: the notification/push title uses the
+                // "Family Hub: <member> – <title>" format (reminder.recordTitle,
+                // the bare record title with no member suffix). The body still
+                // composes off reminder.name ("<title> · <memberName>") — that's
+                // an unrelated, already-correct format for the body sentence
+                // ("… · Papa in 3 days" would read fine either way, but changing
+                // it isn't what was asked for here).
+                const title = familyReminderNotificationTitle(reminder.memberName, reminder.recordTitle);
                 const body = offsetUnit === 'days'
-                  ? notificationBody(title, offsetLabel)
-                  : notificationBodyMinutes(title, offsetLabel);
+                  ? notificationBody(reminder.name, offsetLabel)
+                  : notificationBodyMinutes(reminder.name, offsetLabel);
                 const route = `/family-reminder/${reminder.id}`;
 
                 // Daily/weekday-repeating kinds (routines, check-ins) reuse the same
