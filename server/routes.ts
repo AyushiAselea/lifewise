@@ -3577,8 +3577,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const buildLlmPrompt = (ocrText: string) =>
           `You are an expert bill/invoice data extractor. Below is raw OCR text from a bill image.
 RAW TEXT:\n---\n${ocrText}\n---
-Extract: 1) bill_amount: FINAL TOTAL payable (look for Total/Net Amount/Amount Payable/Net Payable/ભરવાની રકમ/कुल देय). 2) due_date: The PAYMENT DUE DATE. Look for text matching "due date", "payment due", "pay by", "due on", "last date", "payable by" (case-insensitive). Return the date associated with this label, NOT the invoice date or statement period. Return in DD/MM/YYYY format as found, and convert to YYYY-MM-DD. 3) vendor: service provider name. 4) bill_type: electricity/water/gas/internet/telephone/other
-RULES: ONLY valid JSON, no explanation. If due_date cannot be found, return null.
+CRITICAL INSTRUCTION FOR due_date: Find the PAYMENT DUE DATE by looking for these exact label patterns (case-insensitive, with or without colon):
+- "due date"
+- "payment due"
+- "pay by"
+- "due on"
+- "payable by"
+- "last date"
+- "last payment date"
+Match the LABEL, then extract the date associated with it. Do NOT pick invoice date, statement period start/end, or bill date. If you cannot find a due date label, return null — do not guess or substitute.
+
+Extract: 1) bill_amount: FINAL TOTAL payable (look for Total/Net Amount/Amount Payable/Net Payable/ભરવાની રકમ/कुल देय). 2) due_date: As described above — null if not found. Parse as DD/MM/YYYY from the bill, convert to YYYY-MM-DD format. 3) vendor: service provider name. 4) bill_type: electricity/water/gas/internet/telephone/other
+RULES: ONLY valid JSON, no explanation. Return null for due_date if not found — never guess a date.
 {"bill_amount": <number>, "due_date": "<YYYY-MM-DD or null>", "vendor": "<string>", "bill_type": "<string>"}`;
 
         const callPuterLlm = async (ocrText: string): Promise<boolean> => {
@@ -3671,14 +3681,30 @@ RULES: ONLY valid JSON, no explanation. If due_date cannot be found, return null
             const amounts = matches.map(m => parseFloat(m[1].replace(/,/g, ''))).filter(n => n > 0 && n < 1000000);
             if (amounts.length > 0) { extractedAmount = Math.max(...amounts); extractionMethod = 'regex'; break; }
           }
-          const dm = rawOcrText.match(/(?:due date|last date|pay before)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
-          if (dm) { const pd = parseAnyDate(dm[1]); if (pd) extractedDueDate = pd; }
+          // Try multiple patterns to find due date label
+          const duePatterns = [
+            /(?:due date|payment due|pay by|due on|payable by|last date|last payment date)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+            /due\s*date[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+            /payment.*?due[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+            /pay\s*by[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i
+          ];
+          for (const pattern of duePatterns) {
+            const dm = rawOcrText.match(pattern);
+            if (dm) {
+              const pd = parseAnyDate(dm[1]);
+              if (pd) {
+                extractedDueDate = pd;
+                break;
+              }
+            }
+          }
           const vm = rawOcrText.match(/(DGVCL|PGVCL|MGVCL|UGVCL|BESCOM|MSEDCL|CESC|BSES|Airtel|BSNL|Jio|Tata|Adani|TORRENT)/i);
           if (vm) extractedVendor = vm[1];
         }
 
         // ─── RESPONSE ───
         let finalDueDate: string | null = null;
+        let dateExtracted = false;
         if (extractedDueDate) {
           try {
             const d = new Date(extractedDueDate);
@@ -3687,22 +3713,16 @@ RULES: ONLY valid JSON, no explanation. If due_date cannot be found, return null
               const month = String(d.getUTCMonth() + 1).padStart(2, '0');
               const day = String(d.getUTCDate()).padStart(2, '0');
               finalDueDate = `${year}-${month}-${day}T00:00:00.000Z`;
+              dateExtracted = true;
             }
           } catch (e) {
             console.error('[BillScan] Date parse error:', e);
           }
         }
-        if (!finalDueDate) {
-          const d = new Date();
-          d.setUTCDate(d.getUTCDate() + 7);
-          const year = d.getUTCFullYear();
-          const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-          const day = String(d.getUTCDate()).padStart(2, '0');
-          finalDueDate = `${year}-${month}-${day}T00:00:00.000Z`;
-        }
 
         const finalAmount = extractedAmount && extractedAmount > 0 ? extractedAmount : 0;
-        console.log('[BillScan] ✅ FINAL:', { finalAmount, extractedVendor, extractionMethod });
+        const overallConfidence = finalAmount > 0 && dateExtracted ? 95 : (finalAmount > 0 ? 70 : 40);
+        console.log('[BillScan] ✅ FINAL:', { finalAmount, finalDueDate, extractedVendor, dateExtracted, extractionMethod });
 
         return res.json({
           preview: {
@@ -3713,9 +3733,9 @@ RULES: ONLY valid JSON, no explanation. If due_date cannot be found, return null
           metadata: {
             bill_amount: finalAmount, due_date: finalDueDate,
             status: finalAmount > 0 ? 'success' : 'partial',
-            confidence: finalAmount > 0 ? 95 : 40,
+            confidence: overallConfidence,
             method: extractionMethod,
-            note: finalAmount === 0 ? 'Amount not detected. Please enter manually.' : undefined
+            note: !finalDueDate ? 'Due date not detected. Please enter manually.' : (finalAmount === 0 ? 'Amount not detected. Please enter manually.' : undefined)
           }
         });
 
