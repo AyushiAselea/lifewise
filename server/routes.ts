@@ -3553,9 +3553,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const s = String(dateStr).trim();
           if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
           const m1 = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
-          if (m1) return `${m1[3]}-${m1[2].padStart(2,'0')}-${m1[1].padStart(2,'0')}`;
+          if (m1) {
+            const day = m1[1].padStart(2, '0');
+            const month = m1[2].padStart(2, '0');
+            const year = m1[3];
+            return `${year}-${month}-${day}`;
+          }
           const m2 = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2})$/);
-          if (m2) return `20${m2[3]}-${m2[2].padStart(2,'0')}-${m2[1].padStart(2,'0')}`;
+          if (m2) {
+            const day = m2[1].padStart(2, '0');
+            const month = m2[2].padStart(2, '0');
+            const year = `20${m2[3]}`;
+            return `${year}-${month}-${day}`;
+          }
           return null;
         };
         const parseAmount = (val: any): number | null => {
@@ -3567,8 +3577,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const buildLlmPrompt = (ocrText: string) =>
           `You are an expert bill/invoice data extractor. Below is raw OCR text from a bill image.
 RAW TEXT:\n---\n${ocrText}\n---
-Extract: 1) bill_amount: FINAL TOTAL payable (look for Total/Net Amount/Amount Payable/Net Payable/ભરવાની રકમ/कुल देय). 2) due_date: YYYY-MM-DD format. 3) vendor: service provider name. 4) bill_type: electricity/water/gas/internet/telephone/other
-RULES: ONLY valid JSON, no explanation.
+Extract: 1) bill_amount: FINAL TOTAL payable (look for Total/Net Amount/Amount Payable/Net Payable/ભરવાની રકમ/कुल देय). 2) due_date: The PAYMENT DUE DATE. Look for text matching "due date", "payment due", "pay by", "due on", "last date", "payable by" (case-insensitive). Return the date associated with this label, NOT the invoice date or statement period. Return in DD/MM/YYYY format as found, and convert to YYYY-MM-DD. 3) vendor: service provider name. 4) bill_type: electricity/water/gas/internet/telephone/other
+RULES: ONLY valid JSON, no explanation. If due_date cannot be found, return null.
 {"bill_amount": <number>, "due_date": "<YYYY-MM-DD or null>", "vendor": "<string>", "bill_type": "<string>"}`;
 
         const callPuterLlm = async (ocrText: string): Promise<boolean> => {
@@ -3668,9 +3678,28 @@ RULES: ONLY valid JSON, no explanation.
         }
 
         // ─── RESPONSE ───
-        let finalDueDate = extractedDueDate
-          ? (() => { try { const d = new Date(extractedDueDate!); return isNaN(d.getTime()) ? new Date(Date.now() + 7*86400000).toISOString() : d.toISOString(); } catch { return new Date(Date.now() + 7*86400000).toISOString(); } })()
-          : new Date(Date.now() + 7 * 86400000).toISOString();
+        let finalDueDate: string | null = null;
+        if (extractedDueDate) {
+          try {
+            const d = new Date(extractedDueDate);
+            if (!isNaN(d.getTime())) {
+              const year = d.getUTCFullYear();
+              const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+              const day = String(d.getUTCDate()).padStart(2, '0');
+              finalDueDate = `${year}-${month}-${day}T00:00:00.000Z`;
+            }
+          } catch (e) {
+            console.error('[BillScan] Date parse error:', e);
+          }
+        }
+        if (!finalDueDate) {
+          const d = new Date();
+          d.setUTCDate(d.getUTCDate() + 7);
+          const year = d.getUTCFullYear();
+          const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+          const day = String(d.getUTCDate()).padStart(2, '0');
+          finalDueDate = `${year}-${month}-${day}T00:00:00.000Z`;
+        }
 
         const finalAmount = extractedAmount && extractedAmount > 0 ? extractedAmount : 0;
         console.log('[BillScan] ✅ FINAL:', { finalAmount, extractedVendor, extractionMethod });
