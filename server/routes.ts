@@ -982,6 +982,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Outgoing invites for a member — "who have I invited" as opposed to
+  // GET /api/caregiver-invites ("who has invited me"). Owner-only: invitee
+  // email addresses are the owner's information, not something a connected
+  // caregiver should see about other invitees.
+  app.get('/api/family/:memberId/connected-caregivers/invites', authMiddleware, async (req, res) => {
+    try {
+      const requesterId = (req as any).userId;
+      const member = await family.findOne({ _id: toId(req.params.memberId) });
+      if (!member) return res.status(404).json({ message: 'Not found' });
+      if (member.userId !== requesterId) return res.status(403).json({ message: 'Forbidden' });
+
+      const list = await caregiverInvites
+        .find({ memberId: member._id, status: 'pending' })
+        .sort({ createdAt: -1 })
+        .toArray();
+      return res.json(list.map(serializeCaregiverInvite));
+    } catch (err) {
+      console.error('Get pending caregiver invites error:', err);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  });
+
   app.post('/api/family/:memberId/connected-caregivers/invite', authMiddleware, async (req, res) => {
     try {
       const requesterId = (req as any).userId;
@@ -1137,6 +1159,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // --- Caregiver invite inbox ---
+  // Shared shape for both directions of a caregiver invite — "who invited me"
+  // (GET /api/caregiver-invites) and "who have I invited for this member"
+  // (GET /api/family/:memberId/connected-caregivers/invites). Keep these in
+  // sync deliberately; the client parses both lists with one type.
+  function serializeCaregiverInvite(inv: any) {
+    return {
+      id: inv._id.toString(),
+      memberId: inv.memberId?.toString?.() ?? inv.memberId,
+      memberName: inv.memberName,
+      memberAvatarUrl: inv.memberAvatarUrl || null,
+      invitedByName: inv.invitedByName,
+      invitedByEmail: inv.invitedByEmail,
+      inviteeEmail: inv.inviteeEmail,
+      status: inv.status,
+      createdAt: inv.createdAt,
+    };
+  }
+
   app.get('/api/caregiver-invites', authMiddleware, async (req, res) => {
     try {
       const email = ((req as any).userEmail || '').toString().toLowerCase();
@@ -1144,17 +1184,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .find({ inviteeEmail: email, status: 'pending' })
         .sort({ createdAt: -1 })
         .toArray();
-      return res.json(list.map((inv: any) => ({
-        id: inv._id.toString(),
-        memberId: inv.memberId?.toString?.() ?? inv.memberId,
-        memberName: inv.memberName,
-        memberAvatarUrl: inv.memberAvatarUrl || null,
-        invitedByName: inv.invitedByName,
-        invitedByEmail: inv.invitedByEmail,
-        inviteeEmail: inv.inviteeEmail,
-        status: inv.status,
-        createdAt: inv.createdAt,
-      })));
+      return res.json(list.map(serializeCaregiverInvite));
     } catch (err) {
       return res.status(500).json({ message: 'Server error.' });
     }
